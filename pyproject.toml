@@ -1,0 +1,32 @@
+[project]
+name = "resid"
+version = "0.1.0"
+description = "Composable cross-sectional return residualization"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pyarrow>=16",
+    "pydantic>=2.8",
+]
+
+[project.scripts]
+resid = "resid.cli:main"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1",
+    "matplotlib>=3.10",
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/resid/__init__.py" = ["F401"]

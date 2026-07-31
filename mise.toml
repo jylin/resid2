@@ -1,0 +1,23 @@
+[tools]
+python = "3.14"
+ruff = "0.16.1"
+ty = "0.0.65"
+uv = "0.12"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.test]
+run = "uv run pytest"
+
+[tasks.typecheck]
+run = "ty check src tests"
+
+[tasks.lint]
+run = "ruff check --no-cache src tests"
+
+[tasks.format]
+run = """
+ruff check --fix --no-cache src tests
+ruff format --no-cache src tests
+"""
