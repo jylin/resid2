@@ -5,6 +5,12 @@ It includes a CLI for local
 [FinanceData/marcap](https://github.com/FinanceData/marcap) KRX data and does
 not download or supplement that dataset.
 
+## Report
+
+- [Overview](https://jylin.github.io/resid2/)
+- [Walkthrough](https://jylin.github.io/resid2/walkthrough.html)
+- [Design](https://jylin.github.io/resid2/design.html)
+
 ## Setup
 
 Install [mise](https://mise.jdx.dev/getting-started), then:
