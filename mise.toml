@@ -3,6 +3,7 @@ python = "3.14"
 ruff = "0.16.1"
 ty = "0.0.65"
 uv = "0.12"
+"aqua:quarto-dev/quarto-cli" = "1.10.18"
 
 [env]
 _.python.venv = { path = ".venv", create = true }
@@ -21,3 +22,10 @@ run = """
 ruff check --fix --no-cache src tests
 ruff format --no-cache src tests
 """
+
+[tasks.site]
+run = "quarto render site"
+
+[tasks.site-preview]
+description = "Keep the Quarto preview running on a stable local URL"
+run = "quarto preview site --no-browser --host 0.0.0.0"

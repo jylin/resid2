@@ -1,0 +1,163 @@
+---
+title: "Return residualization"
+subtitle: "A point-in-time KRX factor model"
+toc: false
+---
+
+::: {.lead}
+`resid` builds a dated equity universe, computes factor exposures,
+estimates daily factor returns, and exports the unexplained component as
+residual return.
+:::
+
+[Open the walkthrough](walkthrough.qmd){.btn .btn-primary}
+[Read the design](design.qmd){.btn .btn-outline-primary}
+[Use the library](#setup){.btn .btn-outline-primary}
+
+## Setup
+
+Install [mise](https://mise.jdx.dev/getting-started), clone marcap next to
+this repository, then install Python 3.14 and the locked dependencies:
+
+```bash
+git clone https://github.com/FinanceData/marcap.git ../marcap
+mise install
+uv sync
+```
+
+## CLI
+
+The evaluated command uses:
+
+- a daily top-1,000 universe selected from the previous close;
+- sequential OLS over MKT, SMB, HML, and MOM; and
+- coverage, finite-output, reconstruction, and orthogonality checks.
+
+```bash
+uv run resid \
+  --data-dir ../marcap/data \
+  --output-dir output/full \
+  --universe-method daily \
+  --output-years 10 \
+  --universe-size 1000 \
+  --momentum-lookback-days 189 \
+  --momentum-skip-days 63 \
+  --momentum-min-periods 126 \
+  --value-lookback-days 1008 \
+  --value-skip-days 252 \
+  --value-min-periods 756 \
+  --market-beta \
+  --market-beta-lookback-days 252 \
+  --market-beta-min-periods 126 \
+  --market-beta-decay 0.97 \
+  --regression-method ols \
+  --winsor-quantile 0.01 \
+  --minimum-date-coverage 0.99 \
+  --validation-tolerance 1e-12
+```
+
+Omit `--end-date` to use the latest local observation. Use
+`--universe-method fixed` for a first-day snapshot. See every option with
+`uv run resid --help`.
+
+### Outputs
+
+The CSV files use standard factor-model notation:
+
+| Notation | File | Contents | Schema |
+|---|---|---|---|
+| ε | `epsilon.csv` | Specific returns | `(date, ticker, specific_return)` |
+| r | `r.csv` | Returns used by the regression | `(date, ticker, return)` |
+| X | `X.csv` | Normalized exposures | `(date, ticker, <one column per factor>)` |
+| f | `f.csv` | Daily factor returns | `(date, <one column per factor>)` |
+
+`epsilon.csv` is the primary output. The other files support reconstruction
+and diagnosis. X and f store `INTERCEPT`, `MKT`, `SMB`, `HML`, and `MOM` in
+removal order, with `r = Xf + ε`.
+
+Ticker values are zero-padded strings:
+
+```python
+import pandas as pd
+
+epsilon = pd.read_csv("output/full/epsilon.csv", dtype={"ticker": "string"})
+```
+
+## Python API
+
+```python
+from pathlib import Path
+
+import resid
+
+source = resid.MarcapDataSource(Path("../marcap/data"))
+base_model = resid.CharacteristicFactorModel(
+    (
+        resid.size_factor(name="SMB", small_minus_big=True),
+        resid.long_term_reversal_factor(
+            lookback_days=1008,
+            skip_days=252,
+            min_periods=756,
+            name="HML",
+        ),
+        resid.momentum_factor(
+            lookback_days=189,
+            skip_days=63,
+            min_periods=126,
+            name="MOM",
+        ),
+    )
+)
+factor_model = resid.RecursiveMarketBetaModel(
+    base=base_model,
+    lookback_days=252,
+    min_periods=126,
+    decay=0.97,
+    name="MKT",
+)
+
+result = resid.run_pipeline(
+    window=resid.analysis_window(source, years=10, end=None),
+    source=source,
+    universe_builder=resid.DailyTopMarketCapUniverse(size=1000),
+    return_calculator=resid.PercentageReturns(),
+    factor_model=factor_model,
+    residualizer=resid.SequentialOLSResidualizer(
+        factor_order=("MKT", "SMB", "HML", "MOM"),
+        winsor_quantile=0.01,
+        unscaled_factors=("MKT",),
+    ),
+    regression_weight_model=resid.EqualRegressionWeights(),
+    validations=(
+        resid.RegressionCoverageValidation(minimum_date_coverage=0.99),
+        resid.FiniteOutputValidation(),
+        resid.ReturnReconstructionValidation(absolute_tolerance=1e-12),
+        resid.SequentialOrthogonalityValidation(absolute_tolerance=1e-12),
+    ),
+)
+resid.CsvArtifactWriter().write(result, Path("output/full"))
+```
+
+Key choices:
+
+- Factor order sets attribution priority; changing it changes the model.
+- MKT stays in beta units through `unscaled_factors`; the styles use
+  standardized exposures.
+- `RecursiveMarketBetaModel` adds stateful beta to the style model. Use the
+  style model directly to omit it.
+- Sequential WLS and joint OLS are available behind the same residualizer
+  boundary.
+
+## Contracts
+
+| Stage output | Contract |
+|---|---|
+| Market data | DataFrame indexed by `(date, ticker)` with `return_percent` and `market_cap` |
+| Universe | Boolean Series indexed by `(date, ticker)` |
+| Returns | Series named `return`, indexed by `(date, ticker)` |
+| Exposures | DataFrame indexed by `(date, ticker)`, one column per factor |
+| Regression weights | Positive Series indexed by `(date, ticker)` |
+| Result | `ResidualizationResult` with ε, r, X, f, weights, diagnostics, universe, and validation results |
+
+ty checks the callable interfaces; integration tests cover the DataFrame
+schemas.

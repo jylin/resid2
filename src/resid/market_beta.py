@@ -17,7 +17,13 @@ from resid.regression import CrossSectionFit
     config=ConfigDict(arbitrary_types_allowed=True),
 )
 class RecursiveMarketBetaModel:
-    """Add market beta using prior state, then update it after each daily fit."""
+    """Add market beta using prior state, then update it after each daily fit.
+
+    Exposures are raw betas on the same scale as the bootstrap and the
+    `initial_beta` prior, and `update` inverts the regression's normalization so
+    the recursion stays on that scale. Naming this factor in the residualizer's
+    `unscaled_factors` keeps its reported slope in per-unit-beta return terms.
+    """
 
     base: SkipValidation[FactorModel]
     lookback_days: int = Field(gt=0)
@@ -77,10 +83,15 @@ class RecursiveMarketBetaModel:
         dates = history.index.get_level_values("date")
         history = history.loc[dates < analysis_start].dropna()
         history = history.loc[history["weight"] > 0]
-        weighted_returns = history["asset_return"] * history["weight"]
+        initial_members = universe.xs(analysis_start, level="date")
+        initial_tickers = initial_members.index[initial_members.to_numpy(dtype="bool")]
+        market_history = history.loc[
+            history.index.get_level_values("ticker").isin(initial_tickers)
+        ]
+        weighted_returns = market_history["asset_return"] * market_history["weight"]
         market_returns = (
             weighted_returns.groupby(level="date").sum()
-            / history["weight"].groupby(level="date").sum()
+            / market_history["weight"].groupby(level="date").sum()
         )
         history["market_return"] = history.index.get_level_values("date").map(
             market_returns
@@ -135,10 +146,23 @@ class _PreparedRecursiveMarketBeta:
     def update(self, date: pd.Timestamp, fit: CrossSectionFit) -> None:
         self.base.update(date, fit)
         factor_return = float(fit.factor_returns[self.name])
-        if not np.isfinite(factor_return):
+        center = float(fit.exposure_centers[self.name])
+        scale = float(fit.exposure_scales[self.name])
+        if not np.isfinite(factor_return) or not np.isfinite(center):
             return
+        if not np.isfinite(scale) or scale <= 0:
+            return
+
+        # The regression normalizes this column to x = (beta - center) / scale, so
+        # its slope prices a normalized unit, not a unit of beta. Undo that affine
+        # map before updating state, otherwise the recursion drifts onto whatever
+        # scale the cross-section happened to have and stops being comparable to
+        # the bootstrap beta or to the explicit prior.
+        beta_return = factor_return / scale
         factor_fitted = fit.exposures[self.name] * factor_return
-        target_returns = fit.returns - (fit.fitted_returns - factor_fitted)
+        target_returns = (
+            fit.returns - (fit.fitted_returns - factor_fitted) + center * beta_return
+        )
         for ticker, target_return in target_returns.items():
             if not np.isfinite(target_return):
                 continue
@@ -147,8 +171,11 @@ class _PreparedRecursiveMarketBeta:
             numerator = self.numerators.get(
                 key, self.initial_beta * self.prior_variance
             )
-            denominator = self.decay * denominator + factor_return**2
-            numerator = self.decay * numerator + factor_return * float(target_return)
+            denominator = self.decay * denominator + beta_return**2
+            numerator = self.decay * numerator + beta_return * float(target_return)
+            # Write the bounded beta back rather than clipping on read. Keeping the
+            # raw ratio in state lets it wander far outside the bounds and recover
+            # slowly, which pins twice as much of the exposure column to the rail.
             beta = float(
                 np.clip(
                     numerator / denominator,

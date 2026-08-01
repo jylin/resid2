@@ -101,16 +101,15 @@ class _StaticFactorModel:
         del date, fit
 
 
-def size_factor(name: str) -> Factor:
-    """Log of market capitalization lagged by one trading day."""
+def size_factor(name: str, *, small_minus_big: bool = False) -> Factor:
+    """Lagged log market cap, optionally signed as small minus big."""
 
     def build(_: pd.DataFrame, market_caps: pd.DataFrame) -> pd.DataFrame:
         lagged = market_caps.shift(1).where(lambda values: values > 0)
-        return pd.DataFrame(
-            np.log(lagged.to_numpy()),
-            index=lagged.index,
-            columns=lagged.columns,
-        )
+        values = np.log(lagged.to_numpy())
+        if small_minus_big:
+            values = -values
+        return pd.DataFrame(values, index=lagged.index, columns=lagged.columns)
 
     return Factor(name, build, history_business_days=1)
 
@@ -151,3 +150,29 @@ def momentum_factor(
         build,
         history_business_days=lookback_days + skip_days,
     )
+
+
+def long_term_reversal_factor(
+    lookback_days: int,
+    skip_days: int,
+    min_periods: int,
+    name: str,
+) -> Factor:
+    """Negative trailing return, excluding the recent trend window."""
+
+    if lookback_days < 1 or skip_days < 1:
+        raise ValueError("reversal lookback and skip must be positive")
+    if not 1 <= min_periods <= lookback_days:
+        raise ValueError("min_periods must be between 1 and lookback_days")
+
+    trailing_return = momentum_factor(
+        lookback_days=lookback_days,
+        skip_days=skip_days,
+        min_periods=min_periods,
+        name=name,
+    )
+
+    def build(returns: pd.DataFrame, market_caps: pd.DataFrame) -> pd.DataFrame:
+        return -trailing_return.build(returns, market_caps)
+
+    return Factor(name, build, trailing_return.history_business_days)

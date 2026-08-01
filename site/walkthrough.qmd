@@ -1,0 +1,603 @@
+---
+title: "Walkthrough"
+subtitle: "A ten-year point-in-time model run and evaluation"
+jupyter: python3
+execute:
+  enabled: true
+  warning: false
+---
+
+## Model configuration
+
+The evaluated run uses local marcap observations, a daily top-1,000
+universe selected from the previous close, and four factors:
+
+- **MKT**: recursive market beta.
+- **SMB**: lagged small-minus-big market cap.
+- **HML**: a 12–60 month long-term-reversal value proxy.
+- **MOM**: 3–12 month momentum.
+
+Sequential OLS removes them in that order after 1% exposure winsorization, with
+every name given equal regression influence. MKT is named in `unscaled_factors`
+so its exposure keeps beta's own unit; the other three are scaled to unit
+variance.
+
+```{python}
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+import resid
+
+pd.set_option("display.max_columns", 12)
+
+data_dir = Path("../../marcap/data")
+source = resid.MarcapDataSource(data_dir)
+base_factor_model = resid.CharacteristicFactorModel(
+    (
+        resid.size_factor(name="SMB", small_minus_big=True),
+        resid.long_term_reversal_factor(
+            lookback_days=1008,
+            skip_days=252,
+            min_periods=756,
+            name="HML",
+        ),
+        resid.momentum_factor(
+            lookback_days=189,
+            skip_days=63,
+            min_periods=126,
+            name="MOM",
+        ),
+    )
+)
+factor_model = resid.RecursiveMarketBetaModel(
+    base=base_factor_model,
+    lookback_days=252,
+    min_periods=126,
+    decay=0.97,
+    name="MKT",
+)
+window = resid.analysis_window(source, years=10, end=None)
+universe_builder = resid.DailyTopMarketCapUniverse(size=1000)
+return_calculator = resid.PercentageReturns()
+factor_order = ("MKT", "SMB", "HML", "MOM")
+residualizer = resid.SequentialOLSResidualizer(
+    factor_order=factor_order,
+    winsor_quantile=0.01,
+    unscaled_factors=("MKT",),
+)
+regression_weight_model = resid.EqualRegressionWeights()
+validations = (
+    resid.RegressionCoverageValidation(minimum_date_coverage=0.99),
+    resid.FiniteOutputValidation(),
+    resid.ReturnReconstructionValidation(absolute_tolerance=1e-12),
+    resid.SequentialOrthogonalityValidation(absolute_tolerance=1e-12),
+)
+
+started = perf_counter()
+result = resid.run_pipeline(
+    window=window,
+    source=source,
+    universe_builder=universe_builder,
+    return_calculator=return_calculator,
+    factor_model=factor_model,
+    residualizer=residualizer,
+    regression_weight_model=regression_weight_model,
+    validations=validations,
+)
+elapsed_seconds = perf_counter() - started
+```
+
+```{python}
+raw = result.returns.set_index(["date", "ticker"])["return"]
+specific = result.specific_returns.set_index(["date", "ticker"])[
+    "specific_return"
+]
+diagnostics = result.diagnostics.set_index("date")
+regression_weights = result.regression_weights.set_index(["date", "ticker"])[
+    "regression_weight"
+].reindex(raw.index)
+weight_sums = regression_weights.groupby(level="date").sum()
+raw_dispersion = raw.groupby(level="date").std(ddof=0)
+specific_dispersion = specific.groupby(level="date").std(ddof=0)
+
+members = {
+    date: frozenset(group.index.get_level_values("ticker"))
+    for date, group in result.universe.loc[result.universe].groupby(level="date")
+}
+membership_dates = sorted(members)
+turnover = pd.Series(
+    [
+        np.nan
+        if index == 0
+        else len(members[date] - members[membership_dates[index - 1]])
+        / len(members[date])
+        for index, date in enumerate(membership_dates)
+    ],
+    index=pd.DatetimeIndex(membership_dates),
+    name="turnover",
+)
+
+specific_wide = specific.unstack("ticker")
+consecutive_pairs = specific_wide.notna() & specific_wide.shift(1).notna()
+ticker_autocorrelation = specific_wide.corrwith(specific_wide.shift(1))
+ticker_autocorrelation = ticker_autocorrelation.loc[
+    consecutive_pairs.sum() >= 60
+].dropna()
+
+r_squared = diagnostics["r_squared"]
+factor_columns = [name for name in result.model_columns if name != "INTERCEPT"]
+all_factor_returns = result.factor_returns.set_index("date")
+display_names = {
+    "INTERCEPT": "Market level",
+    "MKT": "Beta premium",
+    "SMB": "SMB (small minus big)",
+    "HML": "HML",
+    "MOM": "MOM",
+}
+
+summary = pd.DataFrame(
+    {
+        "Result": [
+            f"{result.factor_returns['date'].min().date()} to "
+            f"{result.factor_returns['date'].max().date()}",
+            f"{len(result.factor_returns):,}",
+            f"{len(result.specific_returns):,}",
+            f"{result.specific_returns['ticker'].nunique():,}",
+            f"{diagnostics['n_observations'].mean():.1f}",
+            f"{diagnostics['n_observations'].min():.0f}",
+            f"{diagnostics['rank'].eq(len(result.model_columns)).mean():.1%}",
+            f"{r_squared.mean():.2%} / {r_squared.median():.2%}",
+            f"{r_squared.quantile(0.05):.2%} / {r_squared.quantile(0.95):.2%}",
+            f"{raw_dispersion.mean():.2%} / {specific_dispersion.mean():.2%}",
+            f"{specific_dispersion.mean() / raw_dispersion.mean():.2%}",
+            f"{ticker_autocorrelation.mean():.2%}",
+            f"{specific.abs().quantile(0.95):.2%} / "
+            f"{specific.abs().quantile(0.99):.2%}",
+            f"{specific.abs().max():.2%}",
+            f"{turnover.mean():.2%} / {turnover.quantile(0.95):.2%}",
+            f"{elapsed_seconds:.1f} seconds",
+        ]
+    },
+    index=[
+        "Window",
+        "Regression dates",
+        "Specific-return rows",
+        "Unique tickers",
+        "Mean observations per regression",
+        "Minimum observations",
+        "Full-rank dates",
+        "Mean / median daily R²",
+        "5th / 95th percentile daily R²",
+        "Mean raw / specific dispersion",
+        "Specific / raw dispersion",
+        "Mean ticker lag-one residual autocorrelation",
+        "95th / 99th percentile absolute residual",
+        "Maximum absolute residual",
+        "Mean / 95th percentile universe turnover",
+        "Runtime on this machine",
+    ],
+)
+summary
+```
+
+The lag-one statistic includes only tickers with at least 60 consecutive
+observation pairs. The observation count reflects the target universe after
+missing returns, weights, and factor histories are removed.
+
+## Universe choice
+
+```{python}
+latest_caps = (
+    source.load(window.end, window.end)["market_cap"]
+    .dropna()
+    .loc[lambda values: values > 0]
+    .sort_values(ascending=False)
+)
+total_market_cap = latest_caps.sum()
+coverage_rows = []
+for size in (200, 500, 1000):
+    selected = latest_caps.iloc[:size]
+    coverage_rows.append(
+        {
+            "Names": size,
+            "Latest market-cap coverage": selected.sum() / total_market_cap,
+            "Smallest included market cap": selected.iloc[-1],
+        }
+    )
+coverage = pd.DataFrame(coverage_rows).set_index("Names")
+
+# Derive the figures quoted below the table so prose and table cannot diverge.
+target_size = universe_builder.size
+listed_count = f"{len(latest_caps):,}"
+target_coverage = f"{coverage.loc[target_size, 'Latest market-cap coverage']:.2%}"
+target_floor = (
+    f"₩{coverage.loc[target_size, 'Smallest included market cap'] / 1e9:,.0f} billion"
+)
+mid_coverage = f"{coverage.loc[500, 'Latest market-cap coverage']:.2%}"
+excluded_count = f"{len(latest_caps) - target_size:,}"
+excluded_share = (
+    f"{1 - coverage.loc[target_size, 'Latest market-cap coverage']:.2%}"
+)
+
+coverage.style.format(
+    {
+        "Latest market-cap coverage": "{:.2%}",
+        "Smallest included market cap": "₩{:,.0f}",
+    }
+)
+```
+
+There are `{python} listed_count` active securities in the latest snapshot:
+
+- Top `{python} f"{target_size:,}"` covers `{python} target_coverage` of market cap
+  and currently ends near `{python} target_floor`.
+- Top 500 covers `{python} mid_coverage`.
+- The excluded `{python} excluded_count` names contribute only
+  `{python} excluded_share` in aggregate, and are the most exposed to sparse
+  trading and stale closes.
+
+Top 1,000 broadens the output while excluding the least liquid tail. Equal
+weights make the fit describe the typical included stock.
+`SquareRootMarketCapWeights` is the large-cap-tilted alternative.
+
+## Ordered factor removal
+
+For each date, the intercept first removes the mean return. Exposures are
+winsorized, then centered, and every exposure except MKT is also scaled to unit
+variance. The model regresses the current residual on each exposure in order and
+passes the new residual to the next factor:
+
+```{mermaid}
+flowchart LR
+    raw["Raw return r"] --> center["Remove intercept"]
+    center --> market["1 · MKT"]
+    market --> size["2 · SMB"]
+    size --> value["3 · HML"]
+    value --> momentum["4 · MOM"]
+    momentum --> epsilon["Specific return ε"]
+```
+
+MKT gets first claim on shared variation, followed by SMB, HML, and MOM.
+Changing that order changes both factor attribution and specific returns.
+
+```{python}
+ordered_x = result.exposures.set_index(["date", "ticker"])
+ordered_f = result.factor_returns.set_index("date")
+aligned_ordered_f = ordered_f.reindex(
+    ordered_x.index.get_level_values("date")
+).set_axis(ordered_x.index)
+weights = regression_weights.reindex(ordered_x.index)
+daily_weight_sums = weights.groupby(level="date").sum()
+weighted_mean = (raw * weights).groupby(level="date").sum() / daily_weight_sums
+aligned_weighted_mean = weighted_mean.reindex(
+    ordered_x.index.get_level_values("date")
+).set_axis(ordered_x.index)
+remaining = raw - aligned_ordered_f["INTERCEPT"]
+total_ss = (
+    weights * (raw - aligned_weighted_mean).pow(2)
+).groupby(level="date").sum()
+stages = []
+for name in factor_order:
+    exposure = ordered_x[name]
+    remaining = remaining - exposure * aligned_ordered_f[name]
+    stage_moment = (
+        (weights * remaining * exposure).groupby(level="date").sum()
+        / daily_weight_sums
+    ).abs()
+    residual_ss = (weights * remaining.pow(2)).groupby(level="date").sum()
+    stages.append(
+        {
+            "factor removed": name,
+            "mean cumulative R²": (1 - residual_ss / total_ss).mean(),
+            "maximum |exposure × stage residual|": stage_moment.max(),
+        }
+    )
+pd.DataFrame(stages).set_index("factor removed")
+```
+
+Each stage moment is measured immediately after removal and should be near
+zero. A later correlated factor can reintroduce an earlier moment, so the same
+calculation against final ε is a diagnostic rather than a validation rule:
+
+```{python}
+final_moments = (
+    ordered_x.loc[:, list(factor_order)]
+    .mul(specific * weights, axis=0)
+    .groupby(level="date")
+    .sum()
+    .div(daily_weight_sums, axis=0)
+    .abs()
+)
+pd.DataFrame(
+    {
+        "mean |exposure × ε|": final_moments.mean(),
+        "maximum |exposure × ε|": final_moments.max(),
+    }
+)
+```
+
+## Factor sensitivity
+
+The intercept is the market-level return. MKT and SMB are relative premia, so
+neither is required to be positive.
+
+| Universe and estimator | MKT, per unit beta | SMB, per standardized unit |
+|---|---:|---:|
+| Top 200, sequential OLS | 1.37% | -1.50% |
+| Top 200, square-root-cap sequential WLS | 2.47% | -2.97% |
+| **Top 1,000, sequential OLS** | **1.42%** | **-3.93%** |
+| Top 1,000, square-root-cap sequential WLS | -2.25% | -4.54% |
+
+SMB is negative in all four runs. MKT turns negative only when top 1,000 is
+combined with WLS; because MKT updates the next period's betas, that choice is
+path-dependent. HML and MOM come later and cannot change these slopes. Compare
+values only within a column because MKT and SMB use different exposure units.
+
+The chart compounds the market-level intercept and cumulatively sums the four
+factor slopes, which are contributions rather than portfolio returns.
+
+## Diagnostics
+
+```{python}
+#| label: fig-evaluation
+#| fig-cap: "Ten-year point-in-time residualization diagnostics"
+#| column: page
+
+figure = make_subplots(
+    rows=2,
+    cols=2,
+    subplot_titles=(
+        "Cross-sectional R²",
+        "Market growth and cumulative factor contributions",
+        "21-day mean cross-sectional dispersion",
+        "21-day mean daily universe turnover",
+    ),
+    vertical_spacing=0.2,
+    horizontal_spacing=0.1,
+)
+figure.add_trace(
+    go.Scatter(
+        x=r_squared.index,
+        y=r_squared,
+        mode="lines",
+        name="Daily R²",
+        legend="legend",
+        line={"color": "#8ca8d8", "width": 1},
+        opacity=0.45,
+    ),
+    row=1,
+    col=1,
+)
+figure.add_trace(
+    go.Scatter(
+        x=r_squared.index,
+        y=r_squared.rolling(63).mean(),
+        mode="lines",
+        name="63-day R²",
+        legend="legend",
+        line={"color": "#2780e3", "width": 2},
+    ),
+    row=1,
+    col=1,
+)
+
+plot_columns = ["INTERCEPT", *factor_columns]
+colors = ["#212529", "#2780e3", "#3fb618", "#9954bb", "#ff7518"]
+cumulative_series = all_factor_returns[plot_columns].cumsum()
+cumulative_series["INTERCEPT"] = (
+    1 + all_factor_returns["INTERCEPT"]
+).cumprod() - 1
+legend_names = {**display_names, "SMB": "SMB"}
+for name, color in zip(plot_columns, colors, strict=True):
+    figure.add_trace(
+        go.Scatter(
+            x=cumulative_series.index,
+            y=cumulative_series[name],
+            mode="lines",
+            name=legend_names[name],
+            legend="legend2",
+            line={"color": color, "width": 2 if name == "INTERCEPT" else 1.5},
+        ),
+        row=1,
+        col=2,
+    )
+
+for name, values, color in (
+    ("Raw dispersion", raw_dispersion, "#ff7518"),
+    ("Specific dispersion", specific_dispersion, "#9954bb"),
+):
+    figure.add_trace(
+        go.Scatter(
+            x=values.index,
+            y=values.rolling(21).mean(),
+            mode="lines",
+            name=name,
+            legend="legend3",
+            line={"color": color, "width": 1.5},
+        ),
+        row=2,
+        col=1,
+    )
+
+figure.add_trace(
+    go.Scatter(
+        x=turnover.index,
+        y=turnover.rolling(21).mean(),
+        mode="lines",
+        name="Universe turnover",
+        legend="legend4",
+        line={"color": "#613d7c", "width": 1.5},
+    ),
+    row=2,
+    col=2,
+)
+figure.update_yaxes(tickformat=".0%", row=1, col=1)
+figure.update_yaxes(tickformat=".0%", row=1, col=2)
+figure.update_yaxes(tickformat=".1%", row=2, col=1)
+figure.update_yaxes(tickformat=".1%", row=2, col=2)
+# One legend per subplot, centred under its own chart. The row-1 legends sit in
+# the inter-row gap opened up by vertical_spacing; the row-2 legends sit in the
+# bottom margin.
+subplot_legend = {
+    "orientation": "h",
+    "xanchor": "center",
+    "yanchor": "top",
+    "bgcolor": "rgba(0,0,0,0)",
+    "font": {"size": 11},
+}
+figure.update_layout(
+    template="plotly_white",
+    hovermode="x",
+    height=920,
+    margin={"l": 45, "r": 20, "t": 80, "b": 120},
+    legend={**subplot_legend, "x": 0.225, "y": 0.545},
+    legend2={**subplot_legend, "x": 0.775, "y": 0.545},
+    legend3={**subplot_legend, "x": 0.225, "y": -0.1},
+    legend4={**subplot_legend, "x": 0.775, "y": -0.1},
+)
+figure.show(config={"displaylogo": False, "responsive": True})
+```
+
+```{python}
+factor_summary = pd.DataFrame(
+    {
+        "Annualized mean": all_factor_returns[plot_columns].mean() * 252,
+        "Annualized volatility": all_factor_returns[plot_columns].std(ddof=0)
+        * np.sqrt(252),
+        "Minimum daily return": all_factor_returns[plot_columns].min(),
+        "Maximum daily return": all_factor_returns[plot_columns].max(),
+    }
+).rename(index=display_names)
+factor_summary.style.format("{:.2%}")
+```
+
+```{python}
+validation_rows = []
+for validation in result.validation_results:
+    validation_rows.append(
+        {"Validation": validation.name, "Passed": validation.passed, **validation.metrics}
+    )
+pd.DataFrame(validation_rows).set_index("Validation").fillna("")
+```
+
+## Customize the analysis
+
+### Window and universe
+
+```python
+window = resid.analysis_window(source, years=5, end="2025-12-31")
+universe_builder = resid.DailyTopMarketCapUniverse(size=500)
+```
+
+`end=None` selects the latest local observation. `DailyTopMarketCapUniverse`
+reselects from the previous close; `FixedTopMarketCapUniverse` holds the
+first-date snapshot. Another point-in-time rule only needs to implement
+`UniverseBuilder.build`.
+
+### Factors and ordering
+
+```python
+def volatility(returns: pd.DataFrame, _: pd.DataFrame) -> pd.DataFrame:
+    return returns.shift(1).rolling(63, min_periods=42).std()
+
+styles = resid.CharacteristicFactorModel(
+    (
+        *base_factor_model.factors,
+        resid.Factor(
+            "VOLATILITY",
+            volatility,
+            history_business_days=64,
+        ),
+    )
+)
+factor_model = resid.RecursiveMarketBetaModel(
+    base=styles,
+    lookback_days=252,
+    min_periods=126,
+    decay=0.97,
+    name="MKT",
+)
+residualizer = resid.SequentialOLSResidualizer(
+    factor_order=("MKT", "SMB", "HML", "VOLATILITY", "MOM"),
+    winsor_quantile=0.01,
+    unscaled_factors=("MKT",),
+)
+```
+
+Add or remove characteristics in `CharacteristicFactorModel`, then make the
+same change to `factor_order`. Lookback, skip, minimum history, beta decay, and
+factor order are model choices. The recursive wrapper is optional when market
+beta is not part of the model.
+
+### Regression and weighting
+
+```python
+regression_weight_model = resid.SquareRootMarketCapWeights()
+residualizer = resid.SequentialWLSResidualizer(
+    factor_order=factor_order,
+    winsor_quantile=0.01,
+    unscaled_factors=("MKT",),
+)
+```
+
+The evaluated configuration pairs `EqualRegressionWeights` with
+`SequentialOLSResidualizer`. The pairing above is the direct cap-weighted
+comparison, and `OLSResidualizer` remains the joint multivariate alternative.
+Weight construction and residualization are separate replaceable boundaries.
+
+### Validation policy
+
+```python
+validations = (
+    resid.RegressionCoverageValidation(minimum_date_coverage=0.995),
+    resid.FiniteOutputValidation(),
+    resid.ReturnReconstructionValidation(absolute_tolerance=1e-12),
+    resid.SequentialOrthogonalityValidation(absolute_tolerance=1e-12),
+)
+```
+
+Coverage and numerical tolerances can vary by use case. Joint OLS uses
+`ResidualOrthogonalityValidation`; the sequential residualizers use the stage-wise
+check shown above. Additional policies implement `RegressionValidation`.
+
+### Output destination
+
+```python
+result.specific_returns
+resid.CsvArtifactWriter().write(result, Path("output/experiment-02"))
+```
+
+The result can be consumed in memory or written to a different experiment
+directory. Another format can write directly from `ResidualizationResult`.
+
+## Interpretation
+
+The mechanical checks pass:
+
+- all expected dates have full-rank fits and finite outputs;
+- stored returns reconstruct as $r = Xf + \varepsilon$; and
+- each factor is orthogonal to the residual immediately after its removal.
+
+Those are regression identities, not proof of a complete risk model. Most
+single-name dispersion remains, later factors can reintroduce moments against
+earlier exposures, and the largest residuals still reflect events and data
+tails. The small mean lag-one autocorrelation is more encouraging: there is no
+obvious broad one-day pattern left in ε.
+
+Recursive beta is the main modeling weakness. It starts from a pre-window
+bootstrap or the 1.0 fallback, then each final MKT slope updates the next
+period's beta. In this run beta dispersion grows until some updates reach the
+$\pm5$ bound. That affects how MKT exposure should be interpreted more than the
+mechanical validity of ε; a production version should test shrinkage, slower
+decay, or an independently observed market return.
+
+## Verdict
+
+The output is a useful baseline for exploratory signal research with tail
+controls. It is not yet a production risk-model residual because the factor set
+is sparse and the recursive beta state is noisy.

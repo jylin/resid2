@@ -17,7 +17,7 @@ resid = "resid.cli:main"
 [dependency-groups]
 dev = [
     "jupyter>=1",
-    "matplotlib>=3.10",
+    "plotly>=6",
     "pytest>=8",
 ]
 

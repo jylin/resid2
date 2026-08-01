@@ -11,6 +11,7 @@ from resid.factors import FactorModel, PreparedFactorModel
 from resid.regression import ResidualizationResult, Residualizer
 from resid.returns import ReturnCalculator
 from resid.validation import RegressionValidation, RegressionValidationError
+from resid.weights import RegressionWeightModel
 
 
 def run_pipeline(
@@ -21,17 +22,23 @@ def run_pipeline(
     return_calculator: ReturnCalculator,
     factor_model: FactorModel,
     residualizer: Residualizer,
+    regression_weight_model: RegressionWeightModel,
     validations: tuple[RegressionValidation, ...] = (),
 ) -> ResidualizationResult:
     """Run the caller-specified stages without writing artifacts."""
 
     universe = universe_builder.build(source, window)
     tickers = universe.index.get_level_values("ticker").unique()
-    history_start = window.start - pd.offsets.BDay(factor_model.history_business_days)
+    history_days = max(
+        factor_model.history_business_days,
+        regression_weight_model.history_business_days,
+    )
+    history_start = window.start - pd.offsets.BDay(history_days)
     market_data = source.load(history_start, window.end, tickers)
     returns = return_calculator.calculate(market_data)
     prepared = factor_model.prepare(market_data, returns, universe)
-    result = _residualize(returns, prepared, residualizer, universe)
+    regression_weights = regression_weight_model.calculate(market_data)
+    result = _residualize(returns, prepared, residualizer, regression_weights, universe)
 
     validation_results = tuple(
         validation.validate(result) for validation in validations
@@ -47,12 +54,14 @@ def _residualize(
     returns: pd.Series,
     factors: PreparedFactorModel,
     residualizer: Residualizer,
+    regression_weights: pd.Series,
     universe: pd.Series,
 ) -> ResidualizationResult:
-    model_columns = ("INTERCEPT", *factors.names)
+    model_columns: tuple[str, ...] | None = None
     exposure_rows: list[pd.DataFrame] = []
     return_rows: list[pd.DataFrame] = []
     specific_rows: list[pd.DataFrame] = []
+    weight_rows: list[pd.DataFrame] = []
     factor_return_rows: list[dict[str, object]] = []
     diagnostic_rows: list[dict[str, object]] = []
     dates = universe.loc[universe].index.get_level_values("date").unique().sort_values()
@@ -65,9 +74,16 @@ def _residualize(
         fit = residualizer.fit(
             day_returns,
             factors.exposures(date_value, tickers),
+            regression_weights.xs(date_value, level="date").reindex(tickers),
         )
         if fit is None:
             continue
+
+        fit_columns = tuple(str(name) for name in fit.factor_returns.index)
+        if model_columns is None:
+            model_columns = fit_columns
+        elif model_columns != fit_columns:
+            raise ValueError("residualizer changed model columns between dates")
 
         date_column = np.repeat(date_value.to_datetime64(), len(fit.returns))
         ticker_column = fit.returns.index.astype("string")
@@ -94,6 +110,15 @@ def _residualize(
                 }
             )
         )
+        weight_rows.append(
+            pd.DataFrame(
+                {
+                    "date": date_column,
+                    "ticker": ticker_column,
+                    "regression_weight": fit.regression_weights.to_numpy(),
+                }
+            )
+        )
         factor_return_rows.append({"date": date_value, **fit.factor_returns.to_dict()})
         diagnostic_rows.append(
             {
@@ -101,19 +126,24 @@ def _residualize(
                 "n_observations": len(fit.returns),
                 "rank": fit.rank,
                 "r_squared": fit.r_squared,
-                "residual_mean": float(fit.specific_returns.mean()),
+                "residual_mean": float(
+                    np.average(fit.specific_returns, weights=fit.regression_weights)
+                ),
             }
         )
         factors.update(date_value, fit)
 
     if not factor_return_rows:
         raise ValueError("no dates had enough valid observations to fit")
+    if model_columns is None:
+        raise RuntimeError("regression results are missing model columns")
     return ResidualizationResult(
         specific_returns=pd.concat(specific_rows, ignore_index=True),
         returns=pd.concat(return_rows, ignore_index=True),
         exposures=pd.concat(exposure_rows, ignore_index=True),
         factor_returns=pd.DataFrame(factor_return_rows),
         diagnostics=pd.DataFrame(diagnostic_rows),
+        regression_weights=pd.concat(weight_rows, ignore_index=True),
         universe=universe,
         model_columns=model_columns,
     )

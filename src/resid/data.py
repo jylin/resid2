@@ -130,6 +130,41 @@ class FixedTopMarketCapUniverse:
         return pd.Series(True, index=index, name="in_universe")
 
 
+@pydantic_dataclass(frozen=True, slots=True)
+class DailyTopMarketCapUniverse:
+    """Select each day's universe using the previous trading day's market cap."""
+
+    size: int = Field(gt=0)
+
+    def build(self, source: MarketDataSource, window: AnalysisWindow) -> pd.Series:
+        dates = source.trading_dates(window.start, window.end)
+        if not len(dates):
+            raise ValueError("analysis window contains no trading dates")
+        previous_date = source.latest_date(
+            (dates[0] - pd.Timedelta(days=1)).date().isoformat()
+        )
+        snapshot_dates = pd.DatetimeIndex([previous_date, *dates[:-1]])
+        snapshot_end = snapshot_dates[-1]
+        snapshots = (
+            source.load(previous_date, snapshot_end)["market_cap"]
+            .rename("market_cap")
+            .reset_index()
+        )
+        effective_dates = dict(zip(snapshot_dates, dates, strict=True))
+        snapshots["date"] = snapshots["date"].map(effective_dates)
+        members = (
+            snapshots.dropna(subset=["date", "market_cap"])
+            .sort_values(
+                ["date", "market_cap", "ticker"],
+                ascending=[True, False, True],
+            )
+            .groupby("date", sort=True)
+            .head(self.size)
+        )
+        index = pd.MultiIndex.from_frame(members[["date", "ticker"]])
+        return pd.Series(True, index=index, name="in_universe").sort_index()
+
+
 def analysis_window(
     source: MarketDataSource,
     years: int,

@@ -1,0 +1,500 @@
+---
+title: "Design"
+---
+
+## Architecture
+
+Two execution paths around one model core, both removing
+`MKT → SMB → HML → MOM`. Research prepares whole arrays at once; live processing
+changes one return at a time.
+
+- **Shared:** the prepared exposures, the configured residualizer, the period's
+  regression weights, `CrossSectionFit`, and the rule that only a final fit
+  advances factor state.
+- **Not shared:** input transport, scheduling, provisional-result handling, and
+  output containers.
+
+```{mermaid}
+flowchart LR
+    history["Historical market frames"] --> batch["run_pipeline"]
+    batch --> vector["Vectorized universe, returns, factors, and weights"]
+    vector --> canonical["SequentialOLSResidualizer.fit"]
+
+    feed["Canonical live events"] --> log["JsonlEventLog"]
+    log --> live["LiveRegressionRunner"]
+    live --> provisional["IncrementalRegression provisional fits"]
+    live --> canonical
+
+    vector --> bridge["historical_events"]
+    bridge --> log
+    canonical --> final["Final CrossSectionFit"]
+    final --> state["PreparedFactorModel.update"]
+```
+
+The event bridge lets the same historical returns go through the log as recorded
+events. Research keeps the vectorized path, and the replay proves the two agree.
+
+### Research sequence
+
+The batch path vectorizes data preparation, then iterates dates so recursive
+state advances in point-in-time order:
+
+```{mermaid}
+sequenceDiagram
+    participant S as MarketDataSource
+    participant U as UniverseBuilder
+    participant P as run_pipeline
+    participant M as FactorModel
+    participant F as PreparedFactorModel
+    participant W as RegressionWeightModel
+    participant R as Residualizer
+    participant V as Validations
+    P->>U: build(source, window)
+    U->>S: Load dated market-cap snapshots
+    U-->>P: Point-in-time membership
+    P->>S: Load member history
+    P->>M: prepare(data, returns, universe)
+    M-->>P: Prepared model
+    P->>W: calculate(data)
+    W-->>P: Dated regression weights
+    loop Each trading date
+        P->>F: exposures(date, tickers)
+        F-->>P: Raw exposures
+        P->>R: fit(returns, exposures, weights)
+        R-->>P: CrossSectionFit
+        P->>F: update(date, fit)
+    end
+    P->>V: validate(result)
+    V-->>P: Named validation results
+```
+
+`run_pipeline` coordinates the stages and returns an in-memory
+`ResidualizationResult`. Writing remains separate.
+
+### Live sequence
+
+The live path records each event before applying it. Tick updates are cheap
+revisions. At period close it goes back to the configured residualizer before any
+state moves.
+
+```{mermaid}
+sequenceDiagram
+    participant A as Feed adapter
+    participant L as EventLog
+    participant P as LiveRegressionRunner
+    participant F as PreparedFactorModel
+    participant I as IncrementalRegression
+    participant R as Residualizer
+    participant O as Output sink
+    A->>P: capture(PeriodOpened with membership and weights)
+    P->>L: append and fsync
+    P->>F: exposures(as_of, tickers)
+    P->>I: initialize(raw exposures, frozen weights)
+    loop ReturnObserved
+        A->>P: capture(return revision)
+        P->>L: append and fsync
+        P->>I: update(ticker, return)
+        I-->>P: provisional CrossSectionFit
+        P-->>O: revisioned provisional result
+    end
+    A->>P: capture(PeriodClosed)
+    P->>L: append and fsync
+    P->>I: finalize()
+    I->>R: canonical fit(all returns, exposures, weights)
+    R-->>I: final CrossSectionFit
+    I-->>P: final CrossSectionFit
+    P->>F: update(as_of, final fit)
+    P-->>O: final LivePeriodResult
+```
+
+Replay substitutes ordered events read from `EventLog` for the feed-adapter
+calls. Everything after event delivery is the same.
+
+### Research and live side by side
+
+| Phase | Research | Live | Shared rule |
+|---|---|---|---|
+| Input | Range-loaded DataFrames | Durable ordered events | Stable ticker IDs, decimal returns, named exposures |
+| Period start | Select membership and lagged weights | `PeriodOpened` freezes membership and weights | Inputs use only prior-known state |
+| Returns | Whole daily cross-section | `ReturnObserved` revises one ticker | One common return horizon per fit |
+| Open-period fit | None | Incremental provisional revisions | Same exposure normalization and model columns |
+| Final fit | One canonical fit per date | Canonical reconciliation at `PeriodClosed` | Same residualizer, weights, and fit result |
+| State | Update after each historical fit | Update only after final close | Final fit advances `PreparedFactorModel` once |
+| Output | `ResidualizationResult`, validations, CSV | Revisioned `LivePeriodResult` | Factor returns, specific returns, diagnostics |
+| Recovery | Rerun vectorized history | Restore and replay the event log | Deterministic point-in-time ordering |
+
+The I/O and scheduling layers differ on purpose. Research wants range scans and
+vectorized frames. Live operation wants subscriptions, watermarks, revisions,
+durability, and recovery. They meet at the prepared exposures and the canonical
+residualizer, not behind a shared read API that would suit neither.
+
+## Stage contracts
+
+### Market data
+
+`MarketDataSource` provides:
+
+- `latest_date(end)`: the last available observation on or before an endpoint.
+- `trading_dates(start, end)`: sorted observed exchange dates.
+- `load(start, end, tickers)`: a DataFrame indexed by normalized
+  `(date, ticker)`, with decimal-compatible `return_percent` and numeric
+  `market_cap`.
+
+Ticker identifiers must be stable strings. Missing observations are allowed;
+later stages drop unusable rows. A different feed only needs an adapter for this
+frame and calendar.
+
+### Universe
+
+`UniverseBuilder.build` returns a Boolean Series indexed by
+`(date, ticker)`. `DailyTopMarketCapUniverse` ranks all observed names by
+the previous trading day's market cap, with ticker as a deterministic tie
+breaker, so membership is known before the return it applies to.
+
+### Returns
+
+`ReturnCalculator.calculate` maps canonical market data to a decimal-return
+Series named `return`. `PercentageReturns` converts marcap's
+corporate-action-aware percentage return field; it does not reconstruct returns
+from close prices.
+
+### Factors
+
+`FactorModel` declares its loading-history padding and prepares a
+`PreparedFactorModel`. The prepared model must provide named,
+ticker-indexed exposures for each date and accept a post-fit `update`.
+Static models make `update` a no-op. Stateful models use it, and the pipeline
+never sees their state.
+
+To plug in a vendor exposure model, return its point-in-time exposure matrix
+through this interface. If the vendor also supplies factor returns or specific
+returns, its adapter replaces the residualizer too, since the local regression
+would no longer be estimating them.
+
+### Regression weights
+
+`RegressionWeightModel.calculate` maps canonical market data to a positive Series
+indexed by `(date, ticker)`. The configured `EqualRegressionWeights` gives every
+usable observation the same influence. `SquareRootMarketCapWeights` uses the
+square root of market cap shifted one trading session, so date $t$ never uses its
+own close. Either scheme replaces the other without changing the universe,
+factors, or estimator.
+
+### Residualization
+
+`Residualizer.fit` receives one day's returns, raw exposures, and regression
+weights, and returns a `CrossSectionFit`, or `None` if the cross-section can't be
+estimated. The configured `SequentialOLSResidualizer` winsorizes every
+exposure once, centers and scales it, removes the intercept, then fits each named
+exposure against the residual left by the preceding step. `factor_order` must
+match the exposure names exactly, so the attribution order is always explicit.
+
+`unscaled_factors` names exposures that are still winsorized and centered but are
+not rescaled to unit variance, so their slopes stay in the exposure's own units.
+Centering is not optional. It keeps each exposure orthogonal to the intercept; an
+uncentered column would leave the market level and that factor fighting over the
+same variation. Every `CrossSectionFit` reports the `exposure_centers` and
+`exposure_scales` it applied, so a stateful factor can invert the map instead of
+guessing at it.
+
+Alternatives behind the same protocol:
+
+- `SequentialWLSResidualizer` with `SquareRootMarketCapWeights` for a
+  cap-weighted ordered fit.
+- `OLSResidualizer` for a joint multivariate fit.
+- Any robust or vendor-supplied estimator, without changing the other stages.
+
+### Validation and output
+
+Validations consume the completed result and return named metrics. The
+configured run checks date coverage, finite values, `r = Xf + ε`, and
+orthogonality immediately after each ordered factor is removed. It makes no claim
+that final ε is jointly orthogonal to every earlier raw exposure. Failed checks
+raise `RegressionValidationError`.
+
+`CsvArtifactWriter` writes ε, r, X, and f atomically. Other formats can write
+the result DataFrames directly.
+
+ty checks the callable protocols; integration tests cover the DataFrame
+schemas.
+
+## Point-in-time construction
+
+Three ways to pick a universe, and why only one is used:
+
+- **End-of-sample selection applied backward** carries survivor and look-ahead
+  bias, because future winners, surviving listings, and later IPOs influence
+  earlier research.
+- **A first-date snapshot held forward** does not look ahead, but goes stale as
+  names list, delist, grow, and shrink. Over one year only a modest fraction of
+  large-cap membership turns over, so the staleness is bounded and the bias is
+  small. Over ten years it compounds: the snapshot progressively describes a
+  different set of stocks than the one that existed, and it silently changes which
+  names have enough history to carry a long-window exposure such as HML.
+- **Daily re-selection from the prior close** is what the model does. Mean one-way
+  membership turnover is 0.75% per day, and the usable output spans 1,916 distinct
+  tickers instead of one fixed list of 1,000.
+
+All dated memberships are computed before factor history loads, then the union of
+required tickers is read in one pass. That is an I/O optimization only. Factors
+still see just each day's membership and lagged data, so future membership never
+sets a dated exposure.
+
+## Model choices and timing
+
+The daily universe targets 1,000 names using prior-session market cap. That
+threshold captures nearly all listed capitalization while leaving out the low-cap
+tail most exposed to sparse trading and stale closes. The walkthrough computes the
+[coverage at each size](walkthrough.qmd#universe-choice) from the data, so those
+figures are not repeated here.
+
+- **MKT:** recursive market-beta exposure. Initial beta uses pre-window asset
+  returns against a lagged-cap-weighted market proxy from the first output
+  universe. Each period uses the prior beta; only the finalized MKT slope
+  updates the exponentially decayed state for the next period. MKT is centered
+  but not rescaled, so its slope is a return per unit of beta, not per standardized
+  unit.
+- **SMB:** negative log market cap lagged one trading observation. Smaller names get
+  higher exposure, so a positive slope means small-minus-big.
+- **HML:** negative compounded return over 1,008 observations shifted by 252,
+  with 756 required observations. It captures approximately 12–60 month
+  reversal: long-term losers have higher exposure. This is a price-based value
+  proxy, not accounting book-to-market HML.
+- **MOM:** compounded return over 189 observations shifted by 63, with 126
+  required observations, approximating the prior 3–12 month trend.
+- **Regression:** sequential OLS after 1% cross-sectional exposure
+  winsorization and centering, in the explicit order MKT, SMB, HML, then MOM.
+  SMB, HML, and MOM are also scaled to unit variance. MKT is not, because beta
+  already has a meaningful unit. Every usable observation carries equal weight.
+
+`history_business_days` is loading padding, not a promise of an exact number
+of KRX observations. The factor builders enforce their own minimum periods.
+
+The intercept is the market-level return. MKT is high-minus-low beta per unit
+of beta; SMB, HML, and MOM are slopes per standardized exposure unit. These are
+realized relative premia, so their signs are not constrained to be positive.
+
+### Recursive beta
+
+Beta must be known before the return it explains:
+
+- Pre-window returns bootstrap beta against a lagged-cap-weighted market proxy.
+- A name without enough history starts from the explicit 1.0 prior.
+- Period $t$ uses the stored beta, estimates MKT, and updates beta only after the
+  fit is final. The updated value first applies to period $t+1$.
+
+The regression can transform raw beta to
+$x_i = (\operatorname{winsor}(\beta_i) - c) / s$. Before updating state it
+converts the fitted slope $f$ back to a per-beta return $g$ and restores the
+centered level:
+
+$$
+g = \frac{f}{s}, \qquad
+y_i = \varepsilon_i + x_i f + c g.
+$$
+
+This keeps the recursive state on the same scale as the bootstrap, prior, and
+$\pm5$ bounds. In the evaluated model MKT is unscaled, so $s=1$, but centering
+still has to be undone.
+
+The bootstrap and update are related but not identical: the bootstrap uses an
+observed market proxy, while the recursion uses the fitted cross-sectional MKT
+premium. That feedback makes the beta path sensitive to universe and weighting
+choices. With `prior_variance=1e-4` and `decay=0.97`, the prior is worth roughly
+25 observations and halves about every 23 trading days.
+
+Sequential removal gives earlier factors first claim on shared variation.
+Changing the order changes f, ε, and the model version.
+
+## Evidence that residualization worked
+
+A mechanically correct sequential result should:
+
+- reconstruct raw returns,
+- be centered by the intercept,
+- be orthogonal to each factor at the moment that factor is removed,
+- have enough cross-sectional rank and coverage,
+- contain finite values.
+
+A later correlated factor can reintroduce a moment against an earlier exposure, so
+final-residual correlations are reported as diagnostics instead of counting as a
+failed fit.
+
+A *useful* specific-return series needs more: stable coverage and dispersion,
+plausible tails, little residual serial structure, and no known look-ahead. See
+[walkthrough.qmd](walkthrough.qmd) for the measured results.
+
+## Authoritative and incremental regression
+
+`SequentialOLSResidualizer.fit` is the authoritative calculation in both modes. It
+aligns returns, exposures, and positive weights, drops unusable rows, winsorizes,
+then centers every column and scales all but MKT using the same moments the
+regression uses. For normalized exposure $x_j$ and fixed weight $w_i$, it
+applies
+
+$$
+e_i^{(0)} = r_i - \frac{\sum_i w_i r_i}{\sum_i w_i}, \qquad
+f_j = \frac{\sum_i w_i x_{ij}e_i^{(j-1)}}{\sum_i w_i x_{ij}^2}, \qquad
+e_i^{(j)} = e_i^{(j-1)} - x_{ij}f_j
+$$
+
+for $j =$ MKT, SMB, HML, MOM. The final $e^{(4)}$ is ε, and the stored
+terms satisfy $r = Xf + \varepsilon$. R² and stage orthogonality use that same
+$w$, which is uniform in the configured run. Residual dispersion stays a separate
+downstream diagnostic. `OLSResidualizer.fit` does the same job in one joint
+`numpy.linalg.lstsq` call, behind the same protocol.
+
+`IncrementalRegression` speeds up either canonical method. It is not a second
+model:
+
+- During an open period it holds raw exposures fixed.
+- A ticker's first usable return rebuilds through the configured residualizer,
+  because the cross-section and normalization changed.
+- Once rows are stable, a cached linear coefficient map applies one return delta
+  without repeating normalization or all regressions, then recalculates ε. For the
+  sequential model that map comes from the same ordered
+  residual-on-residual recurrence, so its cost scales with the small factor set
+  instead of a dense cross-section matrix.
+
+At `PeriodClosed`, `IncrementalRegression.finalize` reruns the canonical fit from
+accumulated returns and raw exposures. Only that result is final, and only it can
+advance recursive factor state, so drift in the accelerator never reaches the
+model. The parity test runs market-first sequential OLS through
+`run_pipeline`, the live event stream, and a reopened log, requiring factor and
+specific returns to match within `1e-12`.
+
+## Performance characteristics
+
+With four factors and roughly 840 names per cross-section, data movement,
+normalization, and output cost more than the regression. The main constraints
+are:
+
+- **Dates must run in order.** Recursive beta for period $t+1$ depends on the
+  finalized fit for period $t$, so the date loop cannot be parallelized. Everything
+  before it is columnar and vectorized: market reads, returns, static factors,
+  universe construction. Independent markets, intervals, or model versions can still
+  run on separate workers.
+- **Memory grows with output, not with the fit.** The full result accumulates in
+  memory, so storage scales with modeled rows times factors. Active model state is
+  only one cross-section.
+- **Durability sets the live latency floor.** `JsonlEventLog.append` fsyncs before
+  processing, which can cost more than the regression. `append_many` amortizes it.
+  Exact event replay works one recorded observation at a time and is slower than
+  vectorized research by design.
+
+The ten-year OLS run covers 2,451 dates and 2,054,729 rows in roughly two minutes
+end to end, peaking near 1.6 GiB. That is one machine, not a guarantee. No intraday
+latency claim is made at all, since marcap is daily and there is no real feed
+adapter.
+
+## Event log and replay
+
+`JsonlEventLog` is a durable, single-process reference implementation of the
+`EventLog` protocol. `LiveRegressionRunner.capture` appends and fsyncs an event
+before applying it, so acknowledged model state never leads its recorded input.
+`append_many` batches that durability cost. Event IDs are idempotent: appending
+the same ID and content returns its existing offset, while conflicting content
+is rejected.
+
+The Pydantic event schemas are:
+
+- `PeriodOpened`: `(market, interval, as_of)` plus aligned fixed-period tickers and regression weights.
+- `ReturnObserved`: one ticker's latest same-horizon decimal return, with
+  `effective_at`, `known_at`, source sequence, and source revision.
+- `PeriodClosed`: the watermark decision that makes the current fit final.
+
+The log assigns a contiguous ingestion offset. `LiveRegressionRunner.replay`
+consumes those offsets in recorded order. Input events do not contain a model
+version, so the same log can be replayed through another model; each
+`LivePeriodResult` does contain the required model version.
+
+`historical_events` turns a point-in-time universe and return Series into the same
+open/observe/close stream. It is the slow, exact-replay path used for parity checks
+and debugging. Normal research keeps the vectorized DataFrame path.
+
+Console logs are not the replay source. Production telemetry can record latency,
+coverage, rank, R², model version, and input offset, but the event ledger is the
+durable input history.
+
+## Live period semantics
+
+`LiveRegressionRunner` owns one `(market, interval)` at a time:
+
+- **Open** fixes the period membership and prior-state exposures.
+- **Observations** revise only the same-horizon return vector.
+- **Close** performs the canonical fit and is the only step that advances factor
+  state.
+
+Every emitted `LivePeriodResult` carries the model version, period key, input
+offset, revision, and final/provisional flag.
+
+Every name in a cross-section needs the same return horizon. An intraday adapter
+would translate ticks into previous-close-to-latest or bar-open-to-latest returns.
+Irregular ticker-to-ticker returns are not a cross-section.
+
+A first intraday version would:
+
+- freeze membership and slow styles from the prior close;
+- publish provisional factor and specific returns on each tick; and
+- advance recursive beta only on finalized bars.
+
+An intraday model also needs decay expressed in bars or trading-time half-life,
+with a separate model version from the daily fit.
+
+Marcap supplies daily observations, so this repository can prove daily
+batch/replay equivalence but cannot demonstrate a real intraday feed.
+
+### Corrections, recovery, and checkpoints
+
+Before close, a later `ReturnObserved` event can revise a ticker and the final fit
+naturally includes it. After recursive state has advanced, a correction must not
+mutate history in place. Append the correction, restore state from a checkpoint
+before the affected period, then replay forward to issue revised outputs.
+
+What exists today versus what production needs:
+
+- **Implemented:** durable capture, replay from the start of a log, and the
+  runner's last processed offset.
+- **Missing:** serialization of prepared-factor and open-period state. A
+  production checkpoint must also carry the model version, active cross-section,
+  and last offset.
+
+The event log remains authoritative; checkpoints are disposable acceleration.
+
+### Non-overlapping market hours
+
+This is an information-alignment problem at every frequency. A closed market's
+return is missing, not zero.
+
+Use one clock and watermark per market:
+
+- **Overlap:** align both markets to the same UTC interval. Finalize after both
+  watermarks; a halt, missing bar, or late observation stays missing.
+- **No overlap:** keep separate market-local fits. For KRX, treat the previous US
+  session as a lagged opening input, freeze US beta before the local open, and
+  remove it before local MKT. If the US factor return is trusted directly, remove
+  `US_BETA × US_RETURN` as a fixed component instead.
+
+Treat the overnight gap and regular session as separate horizons; do not reapply
+the foreign close to every bar. Require `known_at <= as_of`, reject stale inputs,
+and record the session and revision so research replay matches live processing.
+
+## Limitations and extensions
+
+- **Sparse factor set.** No sector, industry, accounting-value, liquidity, or
+  volatility data is imported, so that common structure stays in ε.
+- **HML costs coverage.** It requires 756 observations inside its long window, so
+  the fitted sample averages 838.3 names and bottoms at 795 against a 1,000-name
+  target. A shorter proxy or a neutral missing-exposure policy would recover the
+  coverage but define a different model.
+- **Recursive beta is noisy and path-dependent.** The fitted MKT slope updates
+  the next beta, while each name has roughly 1:19 signal to specific-return noise
+  in the evaluated run. Dispersion reaches the $\pm5$ bound, and names can
+  re-enter with stale state. Shrinkage, slower decay, or an independent market
+  proxy would help; the last option would define a different model and give up
+  cross-sectional orthogonality to beta.
+- **Event and data tails remain.** Marcap's return field handles its source's
+  corporate-action adjustments, but the maximum absolute residual is above 100%.
+  Downstream studies need their own event filters or robust treatment.
+- **The checks are in-sample.** Stage orthogonality and R² are cross-sectional
+  identities, not evidence that these factors predict returns.

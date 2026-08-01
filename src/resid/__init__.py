@@ -3,28 +3,44 @@
 from resid.artifacts import CsvArtifactWriter
 from resid.data import (
     AnalysisWindow,
+    DailyTopMarketCapUniverse,
     FixedTopMarketCapUniverse,
     MarcapDataSource,
     MarketDataSource,
     UniverseBuilder,
     analysis_window,
 )
+from resid.events import (
+    EventLog,
+    JsonlEventLog,
+    LiveEvent,
+    LoggedEvent,
+    PeriodClosed,
+    PeriodKey,
+    PeriodOpened,
+    ReturnObserved,
+)
 from resid.factors import (
     CharacteristicFactorModel,
     Factor,
     FactorModel,
     PreparedFactorModel,
+    long_term_reversal_factor,
     momentum_factor,
     size_factor,
 )
+from resid.live import LivePeriodResult, LiveRegressionRunner, historical_events
 from resid.market_beta import RecursiveMarketBetaModel
 from resid.pipeline import run_pipeline
 from resid.regression import (
     CrossSectionFit,
+    IncrementalRegression,
     OLSResidualizer,
     RegressionValidationResult,
     ResidualizationResult,
     Residualizer,
+    SequentialOLSResidualizer,
+    SequentialWLSResidualizer,
 )
 from resid.returns import PercentageReturns, ReturnCalculator
 from resid.validation import (
@@ -32,5 +48,12 @@ from resid.validation import (
     RegressionCoverageValidation,
     RegressionValidation,
     RegressionValidationError,
+    ResidualOrthogonalityValidation,
     ReturnReconstructionValidation,
+    SequentialOrthogonalityValidation,
+)
+from resid.weights import (
+    EqualRegressionWeights,
+    RegressionWeightModel,
+    SquareRootMarketCapWeights,
 )

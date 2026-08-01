@@ -1,0 +1,46 @@
+project:
+  type: website
+  output-dir: _site
+
+execute:
+  freeze: auto
+
+website:
+  title: resid
+  site-url: https://jylin.github.io/resid2/
+  description: Point-in-time cross-sectional return residualization
+  repo-url: https://github.com/jylin/resid2
+  repo-subdir: site
+  repo-actions: [source]
+  search: true
+  navbar:
+    background: light
+    pinned: true
+    left:
+      - href: index.qmd
+        text: Overview
+      - href: walkthrough.qmd
+        text: Walkthrough
+      - href: design.qmd
+        text: Design
+    right:
+      - icon: github
+        href: https://github.com/jylin/resid2
+        aria-label: GitHub repository
+
+format:
+  html:
+    theme:
+      light: brite
+    toc: true
+    toc-depth: 3
+    smooth-scroll: true
+    anchor-sections: true
+    code-fold: true
+    code-summary: Show code
+    code-copy: true
+    code-overflow: wrap
+    code-tools: true
+    link-external-newwindow: false
+    mermaid:
+      theme: neutral
