@@ -408,10 +408,8 @@ pd.DataFrame(
 
 ## Factor sensitivity
 
-The intercept is the market-level return. The table shows annualized mean factor
-returns; the R² columns are mean daily cross-sectional R² for each run. After the
-recursive update uses the observed market return, the corrected comparison
-snapshot is:
+The table compares two universe sizes and two estimators. Returns are annualized
+mean factor returns; the R² columns are mean daily cross-sectional R².
 
 | Universe and estimator | MKT, per unit beta | SIZE, per standardized unit | MKT stage R² | Final R² |
 |---|---:|---:|---:|---:|
@@ -421,11 +419,12 @@ snapshot is:
 | **Top 1,000, sequential WLS** | **15.62%** | **4.92%** | **2.44%** | **6.56%** |
 
 MKT stage R² is measured after the intercept and before SIZE, HML, and MOM.
-Final R² includes all four factors. The smaller universe has higher R² because
-the included names are more homogeneous and liquid; the broader universe adds
-more idiosyncratic dispersion. The comparison rows are a snapshot from the same
-corrected code; the main run and diagnostics below are recomputed when the page
-is rendered.
+Final R² includes all four factors. The top-200 runs have higher R² because that
+group is more homogeneous. The top-1,000 runs cover more names but also contain
+more noisy, idiosyncratic returns. WLS gives larger companies more influence,
+which is a better fit for that broad universe than giving every name equal weight;
+it is the estimator used for the main run. The comparison rows are a snapshot;
+the main run and diagnostics below are recomputed when the page is rendered.
 
 The chart compounds the market-level intercept and cumulatively sums the four
 factor slopes, which are contributions rather than portfolio returns.
