@@ -451,7 +451,7 @@ def show_chart(figure: go.Figure) -> None:
     figure.show(config={"displaylogo": False, "responsive": True})
 ```
 
-::: {.chart-grid}
+::: {.column-page .diagnostics-panel layout-ncol=2}
 
 ```{python}
 #| label: fig-r2

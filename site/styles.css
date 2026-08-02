@@ -52,29 +52,13 @@ main.content,
   -webkit-overflow-scrolling: touch;
 }
 
-.chart-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1rem;
-  margin: 1rem 0 2rem;
-}
+@media (max-width: 767.98px) {
+  .diagnostics-panel .quarto-layout-row {
+    align-items: stretch;
+  }
 
-.chart-grid > * {
-  min-width: 0;
-}
-
-.chart-grid .cell-output-display,
-.chart-grid .plotly-graph-div {
-  max-width: 100%;
-  min-width: 0;
-}
-
-.chart-grid .plotly-graph-div {
-  width: 100% !important;
-}
-
-@media (max-width: 760px) {
-  .chart-grid {
-    grid-template-columns: minmax(0, 1fr);
+  .diagnostics-panel .quarto-layout-cell {
+    width: 100%;
+    margin-right: 0;
   }
 }
