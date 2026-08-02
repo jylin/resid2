@@ -1,6 +1,5 @@
 ---
 title: "Return residualization"
-subtitle: "A point-in-time KRX factor model"
 toc: false
 ---
 
@@ -10,9 +9,9 @@ estimates daily factor returns, and exports the unexplained component as
 residual return.
 :::
 
-[Open the walkthrough](walkthrough.qmd){.btn .btn-primary}
-[Read the design](design.qmd){.btn .btn-outline-primary}
-[Use the library](#setup){.btn .btn-outline-primary}
+[Walkthrough](walkthrough.qmd){.btn .btn-primary}
+[Design](design.qmd){.btn .btn-outline-primary}
+[Setup](#setup){.btn .btn-outline-primary}
 
 ## Setup
 
@@ -47,8 +46,11 @@ size = 1000
 order = ["MKT", "SIZE", "HML", "MOM"]
 
 [regression]
-method = "ols"
+method = "sqrt-cap-wls"
 ```
+
+The checked-in `resid.toml` adds the required factor windows, output directory,
+and validation settings.
 
 See `uv run resid --help` for all overrides.
 
@@ -66,14 +68,6 @@ The CSV files use standard factor-model notation:
 `epsilon.csv` is the primary output. The other files support reconstruction
 and diagnosis. X and f store `INTERCEPT`, `MKT`, `SIZE`, `HML`, and `MOM` in
 removal order, with `r = Xf + ε`.
-
-Ticker values are zero-padded strings:
-
-```python
-import pandas as pd
-
-epsilon = pd.read_csv("output/full/epsilon.csv", dtype={"ticker": "string"})
-```
 
 ## Python API
 
@@ -114,12 +108,12 @@ result = resid.run_pipeline(
     universe_builder=resid.DailyTopMarketCapUniverse(size=1000),
     return_calculator=resid.PercentageReturns(),
     factor_model=factor_model,
-    residualizer=resid.SequentialOLSResidualizer(
+    residualizer=resid.SequentialWLSResidualizer(
         factor_order=("MKT", "SIZE", "HML", "MOM"),
         winsor_quantile=0.01,
         unscaled_factors=("MKT",),
     ),
-    regression_weight_model=resid.EqualRegressionWeights(),
+    regression_weight_model=resid.SquareRootMarketCapWeights(),
     validations=(
         resid.RegressionCoverageValidation(minimum_date_coverage=0.99),
         resid.FiniteOutputValidation(),

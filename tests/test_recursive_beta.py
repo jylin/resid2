@@ -8,6 +8,7 @@ import pytest
 from resid import (
     AnalysisWindow,
     CharacteristicFactorModel,
+    CrossSectionFit,
     EqualRegressionWeights,
     Factor,
     FixedTopMarketCapUniverse,
@@ -242,3 +243,61 @@ def test_initial_market_proxy_ignores_future_universe_members() -> None:
     perturbed = prepare(perturbed_data)
 
     pd.testing.assert_series_equal(baseline["MARKET_BETA"], perturbed["MARKET_BETA"])
+
+
+def test_recursive_beta_update_uses_observed_market_return() -> None:
+    dates = pd.date_range("2025-01-01", periods=2, freq="B")
+    tickers = pd.Index(["A", "B", "C"], name="ticker")
+    index = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
+    market_data = pd.DataFrame(
+        {
+            "return_percent": np.full(len(index), 2.0),
+            "market_cap": np.tile([1e8, 2e8, 3e8], len(dates)),
+        },
+        index=index,
+    )
+    universe = pd.Series(
+        True,
+        index=pd.MultiIndex.from_product(
+            [[dates[-1]], tickers], names=["date", "ticker"]
+        ),
+        name="in_universe",
+    )
+    model = RecursiveMarketBetaModel(
+        base=CharacteristicFactorModel(
+            (Factor("STYLE", lambda returns, _: returns * 0 + 1, 0),)
+        ),
+        lookback_days=2,
+        min_periods=2,
+        decay=0.97,
+        name="MKT",
+    )
+    returns = PercentageReturns().calculate(market_data)
+    prepared = model.prepare(market_data, returns, universe)
+    exposures = pd.DataFrame({"MKT": [0.2, 0.4, 0.6]}, index=tickers)
+    fit_returns = pd.Series([0.01, 0.02, 0.03], index=tickers, name="return")
+    factor_returns = pd.Series({"INTERCEPT": 0.0, "MKT": -0.5}, name="factor_return")
+    fitted_returns = exposures["MKT"] * factor_returns["MKT"]
+    fit = CrossSectionFit(
+        returns=fit_returns,
+        exposures=exposures,
+        regression_weights=pd.Series(1.0, index=tickers),
+        factor_returns=factor_returns,
+        fitted_returns=fitted_returns,
+        specific_returns=fit_returns - fitted_returns,
+        rank=2,
+        r_squared=0.0,
+        exposure_centers=pd.Series({"MKT": 1.0}),
+        exposure_scales=pd.Series({"MKT": 1.0}),
+    )
+
+    prior_variance = model.prior_variance
+    expected = (
+        model.decay * model.initial_beta * prior_variance
+        + 0.02 * (fit_returns["A"] + 0.02)
+    ) / (model.decay * prior_variance + 0.02**2)
+    prepared.update(dates[-1], fit)
+
+    actual = prepared.exposures(dates[-1], tickers).loc["A", "MKT"]
+    assert actual == pytest.approx(expected)
+    assert actual > 0

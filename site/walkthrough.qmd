@@ -12,14 +12,15 @@ execute:
 The evaluated run uses local marcap observations, a daily top-1,000
 universe selected from the previous close, and four factors:
 
-- **MKT**: recursive market beta.
+- **MKT**: recursive market beta against an observed market proxy.
 - **SIZE**: lagged log market cap.
 - **HML**: a 12–60 month long-term-reversal value proxy.
-- **MOM**: 3–12 month momentum.
+- **MOM**: a 3–9 month trend, measured three months before today.
 
-Sequential OLS removes them in that order after 1% exposure winsorization, with
-every name given equal regression influence. Style exposures are standardized
-before the cross-sectional fits; MKT remains a beta exposure.
+Sequential WLS removes them in that order after 1% exposure winsorization,
+weighting each name by the square root of its lagged market cap. Style
+exposures are weighted and standardized before the fits; MKT remains a beta
+exposure.
 
 ## Factor definitions
 
@@ -29,10 +30,10 @@ today's close.
 
 | Factor | Exposure formula | Meaning |
 |---|---|---|
-| **MKT** | $\beta_{i,t}$ | Recursive beta against the lagged-cap-weighted market return. |
+| **MKT** | $\beta_{i,t}$ | Recursive beta against the observed lagged-cap-weighted market return. |
 | **SIZE** | $\log C_{i,t-1}$ | Larger companies have larger exposure. |
 | **HML** | $-R_{i,t}(1008,252)$ | Long-term reversal: the negative return from 12–60 months ago. |
-| **MOM** | $R_{i,t}(189,63)$ | Return over roughly 3–9 months ago. |
+| **MOM** | $R_{i,t}(189,63)$ | Compounded return over roughly 3–9 months ago. |
 
 Here $R_{i,t}(L,S)$ is the compounded return from the $L$ sessions ending $S$
 sessions before $t$ (implemented with `log1p`, a shift by `S`, and a rolling
@@ -43,8 +44,8 @@ Before each cross-sectional fit, exposures are winsorized and centered. SIZE,
 HML, and MOM are then standardized; MKT stays in beta units.
 
 For the regression below, $w_{i,t}$ is the positive weight for stock $i$ on
-date $t$. The main run uses equal weights, while the WLS comparison uses the
-square root of market cap. $x_{j,i,t}$ is the normalized exposure, $f_{j,t}$
+date $t$. The main run uses the square root of lagged market cap. $x_{j,i,t}$ is
+the normalized exposure, $f_{j,t}$
 is the return attributed to factor $j$, and $e^{(j)}_{i,t}$ is the residual
 after removing the first $j$ factors. With $j$ running in the configured order,
 the sequential regression applies
@@ -64,23 +65,28 @@ later regressions can reintroduce moments against earlier exposures.
 
 At the first usable date, each beta is bootstrapped from a historical
 covariance with the market return. Thereafter the previous beta is frozen for
-the current cross-section. Once that day's MKT return $g_t$ and residual
-$\epsilon_{i,t}$ are known, an exponentially weighted update produces the
-beta used on the next date:
+the current cross-section. Once the observed lagged-cap-weighted market return
+$g_t$ is known, an exponentially weighted update produces the beta used on the
+next date. The fitted cross-sectional MKT slope is kept as an output, but it is
+not fed back as the time-series shock:
 
 $$
 D_{i,t}=\lambda D_{i,t-1}+g_t^2,\qquad
-N_{i,t}=\lambda N_{i,t-1}+g_t(\epsilon_{i,t}+\beta_{i,t}g_t),\qquad
+N_{i,t}=\lambda N_{i,t-1}+g_t y_{i,t},\qquad
 \beta_{i,t+1}=\operatorname{clip}(N_{i,t}/D_{i,t}).
 $$
+
+Here $y_{i,t}=r_{i,t}-(\hat r_{i,t}-x_{i,t}f_{\mathrm{MKT},t})+c_tg_t$:
+the return after removing the intercept and style fits, with the centered beta
+level restored.
 
 The loop is stateful across dates, but it uses the same cross-sectional fit as
 the batch pipeline. The flow is:
 
 ```{mermaid}
 flowchart LR
-    prior["Previous beta β(i,t)"] --> fit["Fit today's MKT return g(t)"]
-    fit --> target["Target = residual + beta × g(t)"]
+    prior["Previous beta β(i,t)"] --> fit["Fit today's cross-section"]
+    fit --> target["Use observed market return g(t)"]
     target --> update["EWLS update with decay λ"]
     update --> next["Freeze beta β(i,t+1)"]
     next --> fit
@@ -93,7 +99,6 @@ from time import perf_counter
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 import resid
 
@@ -129,12 +134,12 @@ window = resid.analysis_window(source, years=10, end=None)
 universe_builder = resid.DailyTopMarketCapUniverse(size=1000)
 return_calculator = resid.PercentageReturns()
 factor_order = ("MKT", "SIZE", "HML", "MOM")
-residualizer = resid.SequentialOLSResidualizer(
+residualizer = resid.SequentialWLSResidualizer(
     factor_order=factor_order,
     winsor_quantile=0.01,
     unscaled_factors=("MKT",),
 )
-regression_weight_model = resid.EqualRegressionWeights()
+regression_weight_model = resid.SquareRootMarketCapWeights()
 validations = (
     resid.RegressionCoverageValidation(minimum_date_coverage=0.99),
     resid.FiniteOutputValidation(),
@@ -247,11 +252,25 @@ summary = pd.DataFrame(
     ],
 )
 summary
+
+latest_beta_date = result.exposures["date"].max()
+latest_betas = result.exposures.loc[
+    result.exposures["date"] == latest_beta_date, "MKT"
+]
+latest_beta_quantiles = latest_betas.quantile([0.01, 0.25, 0.50, 0.75, 0.99])
+latest_beta_quantile_text = ", ".join(
+    f"{value:.2f}" for value in latest_beta_quantiles
+)
 ```
 
 The lag-one statistic includes only tickers with at least 60 consecutive
 observation pairs. The observation count reflects the target universe after
-missing returns, weights, and factor histories are removed.
+missing or non-finite returns, weights, and factor histories are removed.
+
+For each date, R² compares weighted residual sum of squares with the weighted
+cross-sectional dispersion of raw returns around their weighted mean. The WLS
+run uses square-root-cap weights; the OLS comparison uses equal weights. It is
+not a time-series R² against the market proxy.
 
 ## Universe choice
 
@@ -305,9 +324,10 @@ There are `{python} listed_count` active securities in the latest snapshot:
   `{python} excluded_share` in aggregate, and are the most exposed to sparse
   trading and stale closes.
 
-Top 1,000 broadens the output while excluding the least liquid tail. Equal
-weights make the fit describe the typical included stock.
-`SquareRootMarketCapWeights` is the large-cap-tilted alternative.
+Top 1,000 broadens the output while excluding the least liquid tail. The main
+run uses square-root-cap weights, giving larger names more influence. Equal
+weights make the fit describe the typical included stock and are the OLS
+alternative.
 
 ## Ordered factor removal
 
@@ -361,7 +381,8 @@ for name in factor_order:
             "maximum |exposure × stage residual|": stage_moment.max(),
         }
     )
-pd.DataFrame(stages).set_index("factor removed")
+stage_summary = pd.DataFrame(stages).set_index("factor removed")
+stage_summary
 ```
 
 Each stage moment is measured immediately after removal and should be near
@@ -387,20 +408,24 @@ pd.DataFrame(
 
 ## Factor sensitivity
 
-The intercept is the market-level return. MKT and SIZE are relative premia, so
-neither is required to be positive.
+The intercept is the market-level return. The table shows annualized mean factor
+returns; the R² columns are mean daily cross-sectional R² for each run. After the
+recursive update uses the observed market return, the corrected comparison
+snapshot is:
 
-| Universe and estimator | MKT, per unit beta | SIZE, per standardized unit |
-|---|---:|---:|
-| Top 200, sequential OLS | 1.37% | 1.50% |
-| Top 200, square-root-cap sequential WLS | 2.47% | 2.97% |
-| **Top 1,000, sequential OLS** | **1.42%** | **3.93%** |
-| Top 1,000, square-root-cap sequential WLS | -2.25% | 4.54% |
+| Universe and estimator | MKT, per unit beta | SIZE, per standardized unit | MKT stage R² | Final R² |
+|---|---:|---:|---:|---:|
+| Top 200, sequential OLS | 12.68% | 1.55% | 2.95% | 9.26% |
+| Top 200, sequential WLS | 15.65% | 3.25% | 2.50% | 8.63% |
+| Top 1,000, sequential OLS | 15.04% | 3.78% | 2.28% | 4.73% |
+| **Top 1,000, sequential WLS** | **15.62%** | **4.92%** | **2.44%** | **6.56%** |
 
-SIZE is positive in all four runs. MKT turns negative only when top 1,000 is
-combined with WLS; because MKT updates the next period's betas, that choice is
-path-dependent. HML and MOM come later and cannot change these slopes. Compare
-values only within a column because MKT and SIZE use different exposure units.
+MKT stage R² is measured after the intercept and before SIZE, HML, and MOM.
+Final R² includes all four factors. The smaller universe has higher R² because
+the included names are more homogeneous and liquid; the broader universe adds
+more idiosyncratic dispersion. The comparison rows are a snapshot from the same
+corrected code; the main run and diagnostics below are recomputed when the page
+is rendered.
 
 The chart compounds the market-level intercept and cumulatively sums the four
 factor slopes, which are contributions rather than portfolio returns.
@@ -408,48 +433,6 @@ factor slopes, which are contributions rather than portfolio returns.
 ## Diagnostics
 
 ```{python}
-#| label: fig-evaluation
-#| fig-cap: "Ten-year point-in-time residualization diagnostics"
-#| column: page
-
-figure = make_subplots(
-    rows=2,
-    cols=2,
-    subplot_titles=(
-        "Cross-sectional R²",
-        "Market growth and cumulative factor contributions",
-        "21-day mean cross-sectional dispersion",
-        "21-day mean daily universe turnover",
-    ),
-    vertical_spacing=0.2,
-    horizontal_spacing=0.1,
-)
-figure.add_trace(
-    go.Scatter(
-        x=r_squared.index,
-        y=r_squared,
-        mode="lines",
-        name="Daily R²",
-        legend="legend",
-        line={"color": "#8ca8d8", "width": 1},
-        opacity=0.45,
-    ),
-    row=1,
-    col=1,
-)
-figure.add_trace(
-    go.Scatter(
-        x=r_squared.index,
-        y=r_squared.rolling(63).mean(),
-        mode="lines",
-        name="63-day R²",
-        legend="legend",
-        line={"color": "#2780e3", "width": 2},
-    ),
-    row=1,
-    col=1,
-)
-
 plot_columns = ["INTERCEPT", *factor_columns]
 colors = ["#212529", "#2780e3", "#3fb618", "#9954bb", "#ff7518"]
 cumulative_series = all_factor_returns[plot_columns].cumsum()
@@ -457,6 +440,51 @@ cumulative_series["INTERCEPT"] = (
     1 + all_factor_returns["INTERCEPT"]
 ).cumprod() - 1
 legend_names = {**display_names, "SIZE": "SIZE"}
+def show_chart(figure: go.Figure) -> None:
+    figure.update_layout(
+        template="plotly_white",
+        hovermode="x",
+        autosize=True,
+        height=360,
+        margin={"l": 45, "r": 20, "t": 50, "b": 55},
+        legend={"orientation": "h", "y": -0.2},
+    )
+    figure.show(config={"displaylogo": False, "responsive": True})
+```
+
+::: {.chart-grid}
+
+```{python}
+#| label: fig-r2
+#| fig-cap: "Cross-sectional R²"
+figure = go.Figure()
+figure.add_trace(
+    go.Scatter(
+        x=r_squared.index,
+        y=r_squared,
+        mode="lines",
+        name="Daily R²",
+        line={"color": "#8ca8d8", "width": 1},
+        opacity=0.45,
+    )
+)
+figure.add_trace(
+    go.Scatter(
+        x=r_squared.index,
+        y=r_squared.rolling(63).mean(),
+        mode="lines",
+        name="63-day R²",
+        line={"color": "#2780e3", "width": 2},
+    )
+)
+figure.update_yaxes(tickformat=".0%")
+show_chart(figure)
+```
+
+```{python}
+#| label: fig-factor-contributions
+#| fig-cap: "Market growth and cumulative factor contributions"
+figure = go.Figure()
 for name, color in zip(plot_columns, colors, strict=True):
     figure.add_trace(
         go.Scatter(
@@ -464,13 +492,17 @@ for name, color in zip(plot_columns, colors, strict=True):
             y=cumulative_series[name],
             mode="lines",
             name=legend_names[name],
-            legend="legend2",
             line={"color": color, "width": 2 if name == "INTERCEPT" else 1.5},
-        ),
-        row=1,
-        col=2,
+        )
     )
+figure.update_yaxes(tickformat=".0%")
+show_chart(figure)
+```
 
+```{python}
+#| label: fig-dispersion
+#| fig-cap: "21-day mean cross-sectional dispersion"
+figure = go.Figure()
 for name, values, color in (
     ("Raw dispersion", raw_dispersion, "#ff7518"),
     ("Residual dispersion", residual_dispersion, "#9954bb"),
@@ -481,51 +513,30 @@ for name, values, color in (
             y=values.rolling(21).mean(),
             mode="lines",
             name=name,
-            legend="legend3",
             line={"color": color, "width": 1.5},
-        ),
-        row=2,
-        col=1,
+        )
     )
+figure.update_yaxes(tickformat=".1%")
+show_chart(figure)
+```
 
-figure.add_trace(
+```{python}
+#| label: fig-turnover
+#| fig-cap: "21-day mean daily universe turnover"
+figure = go.Figure(
     go.Scatter(
         x=turnover.index,
         y=turnover.rolling(21).mean(),
         mode="lines",
         name="Universe turnover",
-        legend="legend4",
         line={"color": "#613d7c", "width": 1.5},
-    ),
-    row=2,
-    col=2,
+    )
 )
-figure.update_yaxes(tickformat=".0%", row=1, col=1)
-figure.update_yaxes(tickformat=".0%", row=1, col=2)
-figure.update_yaxes(tickformat=".1%", row=2, col=1)
-figure.update_yaxes(tickformat=".1%", row=2, col=2)
-# One legend per subplot, centred under its own chart. The row-1 legends sit in
-# the inter-row gap opened up by vertical_spacing; the row-2 legends sit in the
-# bottom margin.
-subplot_legend = {
-    "orientation": "h",
-    "xanchor": "center",
-    "yanchor": "top",
-    "bgcolor": "rgba(0,0,0,0)",
-    "font": {"size": 11},
-}
-figure.update_layout(
-    template="plotly_white",
-    hovermode="x",
-    height=920,
-    margin={"l": 45, "r": 20, "t": 80, "b": 120},
-    legend={**subplot_legend, "x": 0.225, "y": 0.545},
-    legend2={**subplot_legend, "x": 0.775, "y": 0.545},
-    legend3={**subplot_legend, "x": 0.225, "y": -0.1},
-    legend4={**subplot_legend, "x": 0.775, "y": -0.1},
-)
-figure.show(config={"displaylogo": False, "responsive": True})
+figure.update_yaxes(tickformat=".1%")
+show_chart(figure)
 ```
+
+:::
 
 ```{python}
 factor_summary = pd.DataFrame(
@@ -615,10 +626,11 @@ residualizer = resid.SequentialWLSResidualizer(
 )
 ```
 
-The evaluated configuration pairs `EqualRegressionWeights` with
-`SequentialOLSResidualizer`. The pairing above is the direct cap-weighted
-comparison, and `OLSResidualizer` remains the joint multivariate alternative.
-Weight construction and residualization are separate replaceable boundaries.
+The evaluated configuration pairs `SquareRootMarketCapWeights` with
+`SequentialWLSResidualizer`. `EqualRegressionWeights` with
+`SequentialOLSResidualizer` is the equal-influence alternative, and
+`OLSResidualizer` remains the joint multivariate option. Weight construction and
+residualization are separate replaceable boundaries.
 
 ### Validation policy
 
@@ -659,12 +671,15 @@ earlier exposures, and the largest residuals still reflect events and data
 tails. The small mean lag-one autocorrelation is more encouraging: there is no
 obvious broad one-day pattern left in ε.
 
-Recursive beta is the main modeling weakness. It starts from a pre-window
-bootstrap or the 1.0 fallback, then each final MKT slope updates the next
-period's beta. In this run beta dispersion grows until some updates reach the
-$\pm5$ bound. That affects how MKT exposure should be interpreted more than the
-mechanical validity of ε; a production version should test shrinkage, slower
-decay, or an independently observed market return.
+The corrected recursive beta starts from a pre-window bootstrap or the 1.0
+fallback, then uses the observed lagged-cap-weighted market return after each
+final fit. In the latest WLS cross-section (`{python} latest_beta_date.date()`),
+the beta quantiles from 1st through 99th percentile are
+`{python} latest_beta_quantile_text`. The MKT stage explains
+`{python} f"{stage_summary.loc['MKT', 'mean cumulative R²']:.2%}"` of daily
+cross-sectional variance on average; all four factors explain
+`{python} f"{r_squared.mean():.2%}"` on average, with a
+`{python} f"{r_squared.median():.2%}"` median.
 
 ## Verdict
 

@@ -8,7 +8,7 @@ import pandas as pd
 
 from resid.data import AnalysisWindow, MarketDataSource, UniverseBuilder
 from resid.factors import FactorModel, PreparedFactorModel
-from resid.regression import ResidualizationResult, Residualizer
+from resid.regression import CrossSectionFit, ResidualizationResult, Residualizer
 from resid.returns import ReturnCalculator
 from resid.validation import RegressionValidation, RegressionValidationError
 from resid.weights import RegressionWeightModel
@@ -85,52 +85,20 @@ def _residualize(
         elif model_columns != fit_columns:
             raise ValueError("residualizer changed model columns between dates")
 
-        date_column = np.repeat(date_value.to_datetime64(), len(fit.returns))
-        ticker_column = fit.returns.index.astype("string")
-        used_exposures = fit.exposures.copy()
-        used_exposures.insert(0, "INTERCEPT", 1.0)
-        used_exposures.insert(0, "ticker", ticker_column)
-        used_exposures.insert(0, "date", date_column)
-        exposure_rows.append(used_exposures.reset_index(drop=True))
-        return_rows.append(
-            pd.DataFrame(
-                {
-                    "date": date_column,
-                    "ticker": ticker_column,
-                    "return": fit.returns.to_numpy(),
-                }
-            )
-        )
-        specific_rows.append(
-            pd.DataFrame(
-                {
-                    "date": date_column,
-                    "ticker": ticker_column,
-                    "specific_return": fit.specific_returns.to_numpy(),
-                }
-            )
-        )
-        weight_rows.append(
-            pd.DataFrame(
-                {
-                    "date": date_column,
-                    "ticker": ticker_column,
-                    "regression_weight": fit.regression_weights.to_numpy(),
-                }
-            )
-        )
-        factor_return_rows.append({"date": date_value, **fit.factor_returns.to_dict()})
-        diagnostic_rows.append(
-            {
-                "date": date_value,
-                "n_observations": len(fit.returns),
-                "rank": fit.rank,
-                "r_squared": fit.r_squared,
-                "residual_mean": float(
-                    np.average(fit.specific_returns, weights=fit.regression_weights)
-                ),
-            }
-        )
+        (
+            exposure_frame,
+            return_frame,
+            specific_frame,
+            weight_frame,
+            factor_return_row,
+            diagnostic_row,
+        ) = _fit_outputs(date_value, fit)
+        exposure_rows.append(exposure_frame)
+        return_rows.append(return_frame)
+        specific_rows.append(specific_frame)
+        weight_rows.append(weight_frame)
+        factor_return_rows.append(factor_return_row)
+        diagnostic_rows.append(diagnostic_row)
         factors.update(date_value, fit)
 
     if not factor_return_rows:
@@ -146,4 +114,50 @@ def _residualize(
         regression_weights=pd.concat(weight_rows, ignore_index=True),
         universe=universe,
         model_columns=model_columns,
+    )
+
+
+def _fit_outputs(
+    date: pd.Timestamp,
+    fit: CrossSectionFit,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, object],
+    dict[str, object],
+]:
+    """Convert one fit into the tabular artifacts accumulated by the pipeline."""
+
+    date_column = np.repeat(date.to_datetime64(), len(fit.returns))
+    ticker_column = fit.returns.index.astype("string")
+    used_exposures = fit.exposures.copy()
+    used_exposures.insert(0, "INTERCEPT", 1.0)
+    used_exposures.insert(0, "ticker", ticker_column)
+    used_exposures.insert(0, "date", date_column)
+    common = {"date": date_column, "ticker": ticker_column}
+    return (
+        used_exposures.reset_index(drop=True),
+        pd.DataFrame({**common, "return": fit.returns.to_numpy()}),
+        pd.DataFrame({**common, "specific_return": fit.specific_returns.to_numpy()}),
+        pd.DataFrame(
+            {
+                **common,
+                "regression_weight": fit.regression_weights.to_numpy(),
+            }
+        ),
+        {"date": date, **fit.factor_returns.to_dict()},
+        {
+            "date": date,
+            "n_observations": len(fit.returns),
+            "rank": fit.rank,
+            "r_squared": fit.r_squared,
+            "residual_mean": float(
+                np.average(
+                    fit.specific_returns,
+                    weights=fit.regression_weights,
+                )
+            ),
+        },
     )

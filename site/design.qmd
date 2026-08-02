@@ -18,7 +18,7 @@ changes one return at a time.
 flowchart LR
     history["Historical market frames"] --> batch["run_pipeline"]
     batch --> vector["Vectorized universe, returns, factors, and weights"]
-    vector --> canonical["SequentialOLSResidualizer.fit"]
+    vector --> canonical["Configured Residualizer.fit"]
 
     feed["Canonical live events"] --> log["JsonlEventLog"]
     log --> live["LiveRegressionRunner"]
@@ -140,9 +140,9 @@ residualizer, not behind a shared read API that would suit neither.
   `(date, ticker)`, with decimal-compatible `return_percent` and numeric
   `market_cap`.
 
-Ticker identifiers must be stable strings. Missing observations are allowed;
-later stages drop unusable rows. A different feed only needs an adapter for this
-frame and calendar.
+Ticker identifiers must be stable strings. Missing or non-finite observations
+are allowed; later stages drop unusable rows. A different feed only needs an
+adapter for this frame and calendar.
 
 ### Universe
 
@@ -174,17 +174,16 @@ would no longer be estimating them.
 ### Regression weights
 
 `RegressionWeightModel.calculate` maps canonical market data to a positive Series
-indexed by `(date, ticker)`. The configured `EqualRegressionWeights` gives every
-usable observation the same influence. `SquareRootMarketCapWeights` uses the
+indexed by `(date, ticker)`. The configured `SquareRootMarketCapWeights` uses the
 square root of market cap shifted one trading session, so date $t$ never uses its
-own close. Either scheme replaces the other without changing the universe,
-factors, or estimator.
+own close. `EqualRegressionWeights` is the equal-influence alternative. Either
+scheme replaces the other without changing the universe, factors, or estimator.
 
 ### Residualization
 
 `Residualizer.fit` receives one day's returns, raw exposures, and regression
 weights, and returns a `CrossSectionFit`, or `None` if the cross-section can't be
-estimated. The configured `SequentialOLSResidualizer` winsorizes every
+estimated. The configured `SequentialWLSResidualizer` winsorizes every
 exposure once, centers and scales it, removes the intercept, then fits each named
 exposure against the residual left by the preceding step. `factor_order` must
 match the exposure names exactly, so the attribution order is always explicit.
@@ -199,8 +198,8 @@ guessing at it.
 
 Alternatives behind the same protocol:
 
-- `SequentialWLSResidualizer` with `SquareRootMarketCapWeights` for a
-  cap-weighted ordered fit.
+- `SequentialOLSResidualizer` with `EqualRegressionWeights` for an
+  equal-influence ordered fit.
 - `OLSResidualizer` for a joint multivariate fit.
 - Any robust or vendor-supplied estimator, without changing the other stages.
 
@@ -214,9 +213,6 @@ raise `RegressionValidationError`.
 
 `CsvArtifactWriter` writes ε, r, X, and f atomically. Other formats can write
 the result DataFrames directly.
-
-ty checks the callable protocols; integration tests cover the DataFrame
-schemas.
 
 ## Point-in-time construction
 
@@ -250,10 +246,10 @@ figures are not repeated here.
 
 - **MKT:** recursive market-beta exposure. Initial beta uses pre-window asset
   returns against a lagged-cap-weighted market proxy from the first output
-  universe. Each period uses the prior beta; only the finalized MKT slope
-  updates the exponentially decayed state for the next period. MKT is centered
-  but not rescaled, so its slope is a return per unit of beta, not per standardized
-  unit.
+  universe. Each period uses the prior beta; the finalized fit then updates the
+  state with that period's observed lagged-cap-weighted market return. MKT is
+  centered but not rescaled, so its slope is a return per unit of beta, not per
+  standardized unit.
 - **SIZE:** log market cap lagged one trading observation. Larger names get
   higher exposure, so a positive slope means big-minus-small.
 - **HML:** negative compounded return over 1,008 observations shifted by 252,
@@ -261,18 +257,21 @@ figures are not repeated here.
   reversal: long-term losers have higher exposure. This is a price-based value
   proxy, not accounting book-to-market HML.
 - **MOM:** compounded return over 189 observations shifted by 63, with 126
-  required observations, approximating the prior 3–12 month trend.
-- **Regression:** sequential OLS after 1% cross-sectional exposure
+  required observations, approximating a 3–9 month trend ending three months
+  before today.
+- **Regression:** sequential WLS after 1% cross-sectional exposure
   winsorization and centering, in the explicit order MKT, SIZE, HML, then MOM.
   SIZE, HML, and MOM are also scaled to unit variance. MKT is not, because beta
-  already has a meaningful unit. Every usable observation carries equal weight.
+  already has a meaningful unit. The configured weight is the square root of
+  lagged market cap.
 
 `history_business_days` is loading padding, not a promise of an exact number
 of KRX observations. The factor builders enforce their own minimum periods.
 
-The intercept is the market-level return. MKT is high-minus-low beta per unit
-of beta; SIZE, HML, and MOM are slopes per standardized exposure unit. These are
-realized relative premia, so their signs are not constrained to be positive.
+The intercept is the market-level return. MKT is a cross-sectional slope per
+unit of beta; SIZE, HML, and MOM are slopes per standardized exposure unit.
+These are realized relative premia, so their signs are not constrained to be
+positive.
 
 ### Recursive beta
 
@@ -283,30 +282,36 @@ Beta must be known before the return it explains:
 - Period $t$ uses the stored beta, estimates MKT, and updates beta only after the
   fit is final. The updated value first applies to period $t+1$.
 
-The regression can transform raw beta to
-$x_i = (\operatorname{winsor}(\beta_i) - c) / s$. Before updating state it
-converts the fitted slope $f$ back to a per-beta return $g$ and restores the
-centered level:
+The regression transforms raw beta to
+$x_i = (\operatorname{winsor}(\beta_i) - c) / s$. Let $g_t$ be the observed
+lagged-cap-weighted market return and $f_t$ the fitted cross-sectional MKT
+slope. Before updating state, remove the fitted MKT component, restore the
+centered level with $g_t$, and update against $g_t$:
 
 $$
-g = \frac{f}{s}, \qquad
-y_i = \varepsilon_i + x_i f + c g.
+y_i = r_i - (\hat r_i - x_i f_t) + c g_t, \qquad
+D_{i,t}=\lambda D_{i,t-1}+g_t^2, \qquad
+N_{i,t}=\lambda N_{i,t-1}+g_t y_i, \qquad
+\beta_{i,t+1}=\operatorname{clip}(N_{i,t}/D_{i,t}).
 $$
 
 This keeps the recursive state on the same scale as the bootstrap, prior, and
-$\pm5$ bounds. In the evaluated model MKT is unscaled, so $s=1$, but centering
-still has to be undone.
+$\pm5$ bounds. In the evaluated model MKT is unscaled, so $s=1$. The fitted
+cross-sectional slope remains a reported factor return but does not become the
+next period's market shock, avoiding feedback from the regression into its own
+exposures.
 
-The bootstrap and update are related but not identical: the bootstrap uses an
-observed market proxy, while the recursion uses the fitted cross-sectional MKT
-premium. That feedback makes the beta path sensitive to universe and weighting
-choices. With `prior_variance=1e-4` and `decay=0.97`, the prior is worth roughly
-25 observations and halves about every 23 trading days.
+The bootstrap and update use the same observed proxy. With
+`prior_variance=1e-4` and `decay=0.97`, the prior is worth roughly 25
+observations and halves about every 23 trading days.
 
 Sequential removal gives earlier factors first claim on shared variation.
 Changing the order changes f, ε, and the model version.
 
 ## Evidence that residualization worked
+
+The numerical examples on this page describe the current rendered report; the
+walkthrough is the executable source for refreshing them after a data update.
 
 A mechanically correct sequential result should:
 
@@ -326,7 +331,8 @@ plausible tails, little residual serial structure, and no known look-ahead. See
 
 ## Authoritative and incremental regression
 
-`SequentialOLSResidualizer.fit` is the authoritative calculation in both modes. It
+`SequentialWLSResidualizer.fit` is the authoritative calculation in the
+configured run. It
 aligns returns, exposures, and positive weights, drops unusable rows, winsorizes,
 then centers every column and scales all but MKT using the same moments the
 regression uses. For normalized exposure $x_j$ and fixed weight $w_i$, it
@@ -340,7 +346,7 @@ $$
 
 for $j =$ MKT, SIZE, HML, MOM. The final $e^{(4)}$ is ε, and the stored
 terms satisfy $r = Xf + \varepsilon$. R² and stage orthogonality use that same
-$w$, which is uniform in the configured run. Residual dispersion stays a separate
+$w$. Residual dispersion stays a separate
 downstream diagnostic. `OLSResidualizer.fit` does the same job in one joint
 `numpy.linalg.lstsq` call, behind the same protocol.
 
@@ -382,10 +388,10 @@ are:
   Exact event replay works one recorded observation at a time and is slower than
   vectorized research by design.
 
-The ten-year OLS run covers 2,451 dates and 2,054,729 rows in roughly two minutes
-end to end, peaking near 1.6 GiB. That is one machine, not a guarantee. No intraday
-latency claim is made at all, since marcap is daily and there is no real feed
-adapter.
+The rendered ten-year WLS run covers 2,451 dates and 2,054,729 rows in about
+78 seconds on the report machine, peaking near 1.6 GiB. That is one machine,
+not a guarantee. No intraday latency claim is made, since marcap is daily and
+there is no real feed adapter.
 
 ## Event log and replay
 
@@ -487,12 +493,12 @@ and record the session and revision so research replay matches live processing.
   the fitted sample averages 838.3 names and bottoms at 795 against a 1,000-name
   target. A shorter proxy or a neutral missing-exposure policy would recover the
   coverage but define a different model.
-- **Recursive beta is noisy and path-dependent.** The fitted MKT slope updates
-  the next beta, while each name has roughly 1:19 signal to residual-return noise
-  in the evaluated run. Dispersion reaches the $\pm5$ bound, and names can
-  re-enter with stale state. Shrinkage, slower decay, or an independent market
-  proxy would help; the last option would define a different model and give up
-  cross-sectional orthogonality to beta.
+- **Recursive beta is still path-dependent.** The state is updated only after a
+  finalized fit, but the shock is the observed market proxy rather than the
+  fitted MKT slope. In the current report snapshot, the latest-date beta
+  quantiles are -0.56, -0.14, 0.07, 0.29, and 0.78 (1st through 99th
+  percentile); fewer than 0.02% of stored exposures reach either bound. A
+  slower decay or stronger shrinkage could still be useful for noisy names.
 - **Event and data tails remain.** Marcap's return field handles its source's
   corporate-action adjustments, but the maximum absolute residual is above 100%.
   Downstream studies need their own event filters or robust treatment.

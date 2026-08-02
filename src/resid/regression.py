@@ -76,10 +76,12 @@ class OLSResidualizer:
     ) -> CrossSectionFit | None:
         del regression_weights
         factor_names = tuple(str(name) for name in exposures.columns)
+        _validate_factor_names(factor_names, self.unscaled_factors, "factor names")
         model_columns = ("INTERCEPT", *factor_names)
         cross_section = pd.concat(
             [returns.rename("return"), exposures], axis=1
         ).dropna()
+        cross_section = _finite_rows(cross_section)
         if len(cross_section) <= len(model_columns):
             return None
 
@@ -191,6 +193,7 @@ def _fit_sequential(
         axis=1,
     ).dropna()
     cross_section = cross_section.loc[cross_section["regression_weight"] > 0]
+    cross_section = _finite_rows(cross_section)
     if len(cross_section) <= len(model_columns):
         return None
 
@@ -378,6 +381,11 @@ def _cross_section_fit(
     )
 
 
+def _finite_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    values = frame.to_numpy(dtype="float64")
+    return frame.loc[np.isfinite(values).all(axis=1)]
+
+
 def _normalize(
     exposures: pd.DataFrame,
     quantile: float,
@@ -458,12 +466,20 @@ def _validate_factor_order(
     factor_order: tuple[str, ...],
     unscaled_factors: tuple[str, ...] = (),
 ) -> None:
-    if not factor_order:
-        raise ValueError("factor_order must contain at least one factor")
-    if any(not name or name == "INTERCEPT" for name in factor_order):
+    _validate_factor_names(factor_order, unscaled_factors, "factor_order")
+
+
+def _validate_factor_names(
+    factor_names: tuple[str, ...],
+    unscaled_factors: tuple[str, ...],
+    label: str,
+) -> None:
+    if not factor_names:
+        raise ValueError(f"{label} must contain at least one factor")
+    if any(not name or name == "INTERCEPT" for name in factor_names):
         raise ValueError("factor names must be non-empty and cannot be INTERCEPT")
-    if len(set(factor_order)) != len(factor_order):
-        raise ValueError("factor_order must contain unique names")
-    unknown = tuple(name for name in unscaled_factors if name not in factor_order)
+    if len(set(factor_names)) != len(factor_names):
+        raise ValueError(f"{label} must contain unique names")
+    unknown = tuple(name for name in unscaled_factors if name not in factor_names)
     if unknown:
         raise ValueError(f"unscaled_factors are not modeled factors: {unknown}")

@@ -30,7 +30,7 @@ min_periods = 126
 decay = 0.97
 
 [regression]
-method = "ols"
+method = "sqrt-cap-wls"
 winsor_quantile = 0.01
 
 [validation]

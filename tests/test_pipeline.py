@@ -198,6 +198,42 @@ def test_ols_recovers_cross_sectional_returns() -> None:
     assert fit.rank == 3
 
 
+def test_regressions_drop_nonfinite_rows() -> None:
+    index = pd.Index([f"A{i}" for i in range(5)], name="ticker")
+    returns = pd.Series([0.01, np.inf, 0.02, 0.03, 0.04], index=index)
+    exposures = pd.DataFrame({"SIZE": np.arange(5.0)}, index=index)
+    weights = pd.Series(1.0, index=index)
+
+    for residualizer in (
+        OLSResidualizer(winsor_quantile=0),
+        SequentialWLSResidualizer(factor_order=("SIZE",), winsor_quantile=0),
+    ):
+        fit = residualizer.fit(returns, exposures, weights)
+        assert fit is not None
+        assert len(fit.returns) == 4
+        assert np.isfinite(fit.factor_returns).all()
+        assert np.isfinite(fit.specific_returns).all()
+
+
+def test_ols_rejects_empty_and_duplicate_factor_names() -> None:
+    index = pd.Index([f"A{i}" for i in range(4)], name="ticker")
+    returns = pd.Series(np.arange(4.0), index=index)
+    weights = pd.Series(1.0, index=index)
+
+    with pytest.raises(ValueError, match="at least one factor"):
+        OLSResidualizer(winsor_quantile=0).fit(
+            returns, pd.DataFrame(index=index), weights
+        )
+
+    duplicate_exposures = pd.DataFrame(
+        np.column_stack([np.arange(4.0), np.arange(4.0)]),
+        index=index,
+        columns=["SIZE", "SIZE"],
+    )
+    with pytest.raises(ValueError, match="unique"):
+        OLSResidualizer(winsor_quantile=0).fit(returns, duplicate_exposures, weights)
+
+
 def test_winsorization_and_standardization_match_pandas() -> None:
     index = pd.Index([f"A{i}" for i in range(8)], name="ticker")
     exposures = pd.DataFrame(

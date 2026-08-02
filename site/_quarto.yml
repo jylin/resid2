@@ -34,6 +34,7 @@ website:
 
 format:
   html:
+    css: styles.css
     theme:
       light: brite
     toc: true
