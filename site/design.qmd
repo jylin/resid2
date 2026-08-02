@@ -5,7 +5,7 @@ title: "Design"
 ## Architecture
 
 Two execution paths around one model core, both removing
-`MKT → SMB → HML → MOM`. Research prepares whole arrays at once; live processing
+`MKT → SIZE → HML → MOM`. Research prepares whole arrays at once; live processing
 changes one return at a time.
 
 - **Shared:** the prepared exposures, the configured residualizer, the period's
@@ -120,7 +120,7 @@ calls. Everything after event delivery is the same.
 | Open-period fit | None | Incremental provisional revisions | Same exposure normalization and model columns |
 | Final fit | One canonical fit per date | Canonical reconciliation at `PeriodClosed` | Same residualizer, weights, and fit result |
 | State | Update after each historical fit | Update only after final close | Final fit advances `PreparedFactorModel` once |
-| Output | `ResidualizationResult`, validations, CSV | Revisioned `LivePeriodResult` | Factor returns, specific returns, diagnostics |
+| Output | `ResidualizationResult`, validations, CSV | Revisioned `LivePeriodResult` | Factor returns, residual returns, diagnostics |
 | Recovery | Rerun vectorized history | Restore and replay the event log | Deterministic point-in-time ordering |
 
 The I/O and scheduling layers differ on purpose. Research wants range scans and
@@ -167,7 +167,7 @@ Static models make `update` a no-op. Stateful models use it, and the pipeline
 never sees their state.
 
 To plug in a vendor exposure model, return its point-in-time exposure matrix
-through this interface. If the vendor also supplies factor returns or specific
+through this interface. If the vendor also supplies factor returns or residual
 returns, its adapter replaces the residualizer too, since the local regression
 would no longer be estimating them.
 
@@ -254,8 +254,8 @@ figures are not repeated here.
   updates the exponentially decayed state for the next period. MKT is centered
   but not rescaled, so its slope is a return per unit of beta, not per standardized
   unit.
-- **SMB:** negative log market cap lagged one trading observation. Smaller names get
-  higher exposure, so a positive slope means small-minus-big.
+- **SIZE:** log market cap lagged one trading observation. Larger names get
+  higher exposure, so a positive slope means big-minus-small.
 - **HML:** negative compounded return over 1,008 observations shifted by 252,
   with 756 required observations. It captures approximately 12–60 month
   reversal: long-term losers have higher exposure. This is a price-based value
@@ -263,15 +263,15 @@ figures are not repeated here.
 - **MOM:** compounded return over 189 observations shifted by 63, with 126
   required observations, approximating the prior 3–12 month trend.
 - **Regression:** sequential OLS after 1% cross-sectional exposure
-  winsorization and centering, in the explicit order MKT, SMB, HML, then MOM.
-  SMB, HML, and MOM are also scaled to unit variance. MKT is not, because beta
+  winsorization and centering, in the explicit order MKT, SIZE, HML, then MOM.
+  SIZE, HML, and MOM are also scaled to unit variance. MKT is not, because beta
   already has a meaningful unit. Every usable observation carries equal weight.
 
 `history_business_days` is loading padding, not a promise of an exact number
 of KRX observations. The factor builders enforce their own minimum periods.
 
 The intercept is the market-level return. MKT is high-minus-low beta per unit
-of beta; SMB, HML, and MOM are slopes per standardized exposure unit. These are
+of beta; SIZE, HML, and MOM are slopes per standardized exposure unit. These are
 realized relative premia, so their signs are not constrained to be positive.
 
 ### Recursive beta
@@ -320,7 +320,7 @@ A later correlated factor can reintroduce a moment against an earlier exposure, 
 final-residual correlations are reported as diagnostics instead of counting as a
 failed fit.
 
-A *useful* specific-return series needs more: stable coverage and dispersion,
+A *useful* residual-return series needs more: stable coverage and dispersion,
 plausible tails, little residual serial structure, and no known look-ahead. See
 [walkthrough.qmd](walkthrough.qmd) for the measured results.
 
@@ -338,7 +338,7 @@ f_j = \frac{\sum_i w_i x_{ij}e_i^{(j-1)}}{\sum_i w_i x_{ij}^2}, \qquad
 e_i^{(j)} = e_i^{(j-1)} - x_{ij}f_j
 $$
 
-for $j =$ MKT, SMB, HML, MOM. The final $e^{(4)}$ is ε, and the stored
+for $j =$ MKT, SIZE, HML, MOM. The final $e^{(4)}$ is ε, and the stored
 terms satisfy $r = Xf + \varepsilon$. R² and stage orthogonality use that same
 $w$, which is uniform in the configured run. Residual dispersion stays a separate
 downstream diagnostic. `OLSResidualizer.fit` does the same job in one joint
@@ -361,7 +361,7 @@ accumulated returns and raw exposures. Only that result is final, and only it ca
 advance recursive factor state, so drift in the accelerator never reaches the
 model. The parity test runs market-first sequential OLS through
 `run_pipeline`, the live event stream, and a reopened log, requiring factor and
-specific returns to match within `1e-12`.
+residual returns to match within `1e-12`.
 
 ## Performance characteristics
 
@@ -435,7 +435,7 @@ Irregular ticker-to-ticker returns are not a cross-section.
 A first intraday version would:
 
 - freeze membership and slow styles from the prior close;
-- publish provisional factor and specific returns on each tick; and
+- publish provisional factor and residual returns on each tick; and
 - advance recursive beta only on finalized bars.
 
 An intraday model also needs decay expressed in bars or trading-time half-life,
@@ -488,7 +488,7 @@ and record the session and revision so research replay matches live processing.
   target. A shorter proxy or a neutral missing-exposure policy would recover the
   coverage but define a different model.
 - **Recursive beta is noisy and path-dependent.** The fitted MKT slope updates
-  the next beta, while each name has roughly 1:19 signal to specific-return noise
+  the next beta, while each name has roughly 1:19 signal to residual-return noise
   in the evaluated run. Dispersion reaches the $\pm5$ bound, and names can
   re-enter with stale state. Shrinkage, slower decay, or an independent market
   proxy would help; the last option would define a different model and give up

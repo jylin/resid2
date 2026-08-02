@@ -13,14 +13,78 @@ The evaluated run uses local marcap observations, a daily top-1,000
 universe selected from the previous close, and four factors:
 
 - **MKT**: recursive market beta.
-- **SMB**: lagged small-minus-big market cap.
+- **SIZE**: lagged log market cap.
 - **HML**: a 12–60 month long-term-reversal value proxy.
 - **MOM**: 3–12 month momentum.
 
 Sequential OLS removes them in that order after 1% exposure winsorization, with
-every name given equal regression influence. MKT is named in `unscaled_factors`
-so its exposure keeps beta's own unit; the other three are scaled to unit
-variance.
+every name given equal regression influence. Style exposures are standardized
+before the cross-sectional fits; MKT remains a beta exposure.
+
+## Factor definitions
+
+Let $r_{i,t}$ be a stock's decimal return and $C_{i,t}$ its market cap. All
+inputs are lagged to the start of the interval, so today's exposure cannot use
+today's close.
+
+| Factor | Exposure formula | Meaning |
+|---|---|---|
+| **MKT** | $\beta_{i,t}$ | Recursive beta against the lagged-cap-weighted market return. |
+| **SIZE** | $\log C_{i,t-1}$ | Larger companies have larger exposure. |
+| **HML** | $-R_{i,t}(1008,252)$ | Long-term reversal: the negative return from 12–60 months ago. |
+| **MOM** | $R_{i,t}(189,63)$ | Return over roughly 3–9 months ago. |
+
+Here $R_{i,t}(L,S)$ is the compounded return from the $L$ sessions ending $S$
+sessions before $t$ (implemented with `log1p`, a shift by `S`, and a rolling
+window of `L`). HML negates this older return, making it a long-term reversal
+exposure.
+
+Before each cross-sectional fit, exposures are winsorized and centered. SIZE,
+HML, and MOM are then standardized; MKT stays in beta units.
+
+For the regression below, $w_{i,t}$ is the positive weight for stock $i$ on
+date $t$. The main run uses equal weights, while the WLS comparison uses the
+square root of market cap. $x_{j,i,t}$ is the normalized exposure, $f_{j,t}$
+is the return attributed to factor $j$, and $e^{(j)}_{i,t}$ is the residual
+after removing the first $j$ factors. With $j$ running in the configured order,
+the sequential regression applies
+$$
+e^{(0)}_{i,t}=r_{i,t}-\frac{\sum_i w_{i,t}r_{i,t}}{\sum_i w_{i,t}},\qquad
+f_{j,t}=\frac{\sum_i w_{i,t}x_{j,i,t}e^{(j-1)}_{i,t}}
+{\sum_i w_{i,t}x_{j,i,t}^{2}},\qquad
+e^{(j)}_{i,t}=e^{(j-1)}_{i,t}-x_{j,i,t}f_{j,t}.
+$$
+
+The factors are removed in the order MKT, SIZE, HML, MOM, so each one explains
+what remains after the earlier factors. The final residual is orthogonal to MOM
+by construction, but it can still have exposure to MKT, SIZE, or HML because
+later regressions can reintroduce moments against earlier exposures.
+
+### Recursive market beta
+
+At the first usable date, each beta is bootstrapped from a historical
+covariance with the market return. Thereafter the previous beta is frozen for
+the current cross-section. Once that day's MKT return $g_t$ and residual
+$\epsilon_{i,t}$ are known, an exponentially weighted update produces the
+beta used on the next date:
+
+$$
+D_{i,t}=\lambda D_{i,t-1}+g_t^2,\qquad
+N_{i,t}=\lambda N_{i,t-1}+g_t(\epsilon_{i,t}+\beta_{i,t}g_t),\qquad
+\beta_{i,t+1}=\operatorname{clip}(N_{i,t}/D_{i,t}).
+$$
+
+The loop is stateful across dates, but it uses the same cross-sectional fit as
+the batch pipeline. The flow is:
+
+```{mermaid}
+flowchart LR
+    prior["Previous beta β(i,t)"] --> fit["Fit today's MKT return g(t)"]
+    fit --> target["Target = residual + beta × g(t)"]
+    target --> update["EWLS update with decay λ"]
+    update --> next["Freeze beta β(i,t+1)"]
+    next --> fit
+```
 
 ```{python}
 from pathlib import Path
@@ -39,7 +103,7 @@ data_dir = Path("../../marcap/data")
 source = resid.MarcapDataSource(data_dir)
 base_factor_model = resid.CharacteristicFactorModel(
     (
-        resid.size_factor(name="SMB", small_minus_big=True),
+        resid.size_factor(name="SIZE"),
         resid.long_term_reversal_factor(
             lookback_days=1008,
             skip_days=252,
@@ -64,7 +128,7 @@ factor_model = resid.RecursiveMarketBetaModel(
 window = resid.analysis_window(source, years=10, end=None)
 universe_builder = resid.DailyTopMarketCapUniverse(size=1000)
 return_calculator = resid.PercentageReturns()
-factor_order = ("MKT", "SMB", "HML", "MOM")
+factor_order = ("MKT", "SIZE", "HML", "MOM")
 residualizer = resid.SequentialOLSResidualizer(
     factor_order=factor_order,
     winsor_quantile=0.01,
@@ -94,7 +158,7 @@ elapsed_seconds = perf_counter() - started
 
 ```{python}
 raw = result.returns.set_index(["date", "ticker"])["return"]
-specific = result.specific_returns.set_index(["date", "ticker"])[
+residual = result.specific_returns.set_index(["date", "ticker"])[
     "specific_return"
 ]
 diagnostics = result.diagnostics.set_index("date")
@@ -103,7 +167,7 @@ regression_weights = result.regression_weights.set_index(["date", "ticker"])[
 ].reindex(raw.index)
 weight_sums = regression_weights.groupby(level="date").sum()
 raw_dispersion = raw.groupby(level="date").std(ddof=0)
-specific_dispersion = specific.groupby(level="date").std(ddof=0)
+residual_dispersion = residual.groupby(level="date").std(ddof=0)
 
 members = {
     date: frozenset(group.index.get_level_values("ticker"))
@@ -122,9 +186,9 @@ turnover = pd.Series(
     name="turnover",
 )
 
-specific_wide = specific.unstack("ticker")
-consecutive_pairs = specific_wide.notna() & specific_wide.shift(1).notna()
-ticker_autocorrelation = specific_wide.corrwith(specific_wide.shift(1))
+residual_wide = residual.unstack("ticker")
+consecutive_pairs = residual_wide.notna() & residual_wide.shift(1).notna()
+ticker_autocorrelation = residual_wide.corrwith(residual_wide.shift(1))
 ticker_autocorrelation = ticker_autocorrelation.loc[
     consecutive_pairs.sum() >= 60
 ].dropna()
@@ -135,7 +199,7 @@ all_factor_returns = result.factor_returns.set_index("date")
 display_names = {
     "INTERCEPT": "Market level",
     "MKT": "Beta premium",
-    "SMB": "SMB (small minus big)",
+    "SIZE": "SIZE",
     "HML": "HML",
     "MOM": "MOM",
 }
@@ -153,12 +217,12 @@ summary = pd.DataFrame(
             f"{diagnostics['rank'].eq(len(result.model_columns)).mean():.1%}",
             f"{r_squared.mean():.2%} / {r_squared.median():.2%}",
             f"{r_squared.quantile(0.05):.2%} / {r_squared.quantile(0.95):.2%}",
-            f"{raw_dispersion.mean():.2%} / {specific_dispersion.mean():.2%}",
-            f"{specific_dispersion.mean() / raw_dispersion.mean():.2%}",
+            f"{raw_dispersion.mean():.2%} / {residual_dispersion.mean():.2%}",
+            f"{residual_dispersion.mean() / raw_dispersion.mean():.2%}",
             f"{ticker_autocorrelation.mean():.2%}",
-            f"{specific.abs().quantile(0.95):.2%} / "
-            f"{specific.abs().quantile(0.99):.2%}",
-            f"{specific.abs().max():.2%}",
+            f"{residual.abs().quantile(0.95):.2%} / "
+            f"{residual.abs().quantile(0.99):.2%}",
+            f"{residual.abs().max():.2%}",
             f"{turnover.mean():.2%} / {turnover.quantile(0.95):.2%}",
             f"{elapsed_seconds:.1f} seconds",
         ]
@@ -166,15 +230,15 @@ summary = pd.DataFrame(
     index=[
         "Window",
         "Regression dates",
-        "Specific-return rows",
+        "Residual-return rows",
         "Unique tickers",
         "Mean observations per regression",
         "Minimum observations",
         "Full-rank dates",
         "Mean / median daily R²",
         "5th / 95th percentile daily R²",
-        "Mean raw / specific dispersion",
-        "Specific / raw dispersion",
+        "Mean raw / residual dispersion",
+        "Residual / raw dispersion",
         "Mean ticker lag-one residual autocorrelation",
         "95th / 99th percentile absolute residual",
         "Maximum absolute residual",
@@ -256,14 +320,14 @@ passes the new residual to the next factor:
 flowchart LR
     raw["Raw return r"] --> center["Remove intercept"]
     center --> market["1 · MKT"]
-    market --> size["2 · SMB"]
+    market --> size["2 · SIZE"]
     size --> value["3 · HML"]
     value --> momentum["4 · MOM"]
-    momentum --> epsilon["Specific return ε"]
+    momentum --> epsilon["Residual return ε"]
 ```
 
-MKT gets first claim on shared variation, followed by SMB, HML, and MOM.
-Changing that order changes both factor attribution and specific returns.
+MKT gets first claim on shared variation, followed by SIZE, HML, and MOM.
+Changing that order changes both factor attribution and residual returns.
 
 ```{python}
 ordered_x = result.exposures.set_index(["date", "ticker"])
@@ -307,7 +371,7 @@ calculation against final ε is a diagnostic rather than a validation rule:
 ```{python}
 final_moments = (
     ordered_x.loc[:, list(factor_order)]
-    .mul(specific * weights, axis=0)
+    .mul(residual * weights, axis=0)
     .groupby(level="date")
     .sum()
     .div(daily_weight_sums, axis=0)
@@ -323,20 +387,20 @@ pd.DataFrame(
 
 ## Factor sensitivity
 
-The intercept is the market-level return. MKT and SMB are relative premia, so
+The intercept is the market-level return. MKT and SIZE are relative premia, so
 neither is required to be positive.
 
-| Universe and estimator | MKT, per unit beta | SMB, per standardized unit |
+| Universe and estimator | MKT, per unit beta | SIZE, per standardized unit |
 |---|---:|---:|
-| Top 200, sequential OLS | 1.37% | -1.50% |
-| Top 200, square-root-cap sequential WLS | 2.47% | -2.97% |
-| **Top 1,000, sequential OLS** | **1.42%** | **-3.93%** |
-| Top 1,000, square-root-cap sequential WLS | -2.25% | -4.54% |
+| Top 200, sequential OLS | 1.37% | 1.50% |
+| Top 200, square-root-cap sequential WLS | 2.47% | 2.97% |
+| **Top 1,000, sequential OLS** | **1.42%** | **3.93%** |
+| Top 1,000, square-root-cap sequential WLS | -2.25% | 4.54% |
 
-SMB is negative in all four runs. MKT turns negative only when top 1,000 is
+SIZE is positive in all four runs. MKT turns negative only when top 1,000 is
 combined with WLS; because MKT updates the next period's betas, that choice is
 path-dependent. HML and MOM come later and cannot change these slopes. Compare
-values only within a column because MKT and SMB use different exposure units.
+values only within a column because MKT and SIZE use different exposure units.
 
 The chart compounds the market-level intercept and cumulatively sums the four
 factor slopes, which are contributions rather than portfolio returns.
@@ -392,7 +456,7 @@ cumulative_series = all_factor_returns[plot_columns].cumsum()
 cumulative_series["INTERCEPT"] = (
     1 + all_factor_returns["INTERCEPT"]
 ).cumprod() - 1
-legend_names = {**display_names, "SMB": "SMB"}
+legend_names = {**display_names, "SIZE": "SIZE"}
 for name, color in zip(plot_columns, colors, strict=True):
     figure.add_trace(
         go.Scatter(
@@ -409,7 +473,7 @@ for name, color in zip(plot_columns, colors, strict=True):
 
 for name, values, color in (
     ("Raw dispersion", raw_dispersion, "#ff7518"),
-    ("Specific dispersion", specific_dispersion, "#9954bb"),
+    ("Residual dispersion", residual_dispersion, "#9954bb"),
 ):
     figure.add_trace(
         go.Scatter(
@@ -479,10 +543,16 @@ factor_summary.style.format("{:.2%}")
 ```{python}
 validation_rows = []
 for validation in result.validation_results:
-    validation_rows.append(
-        {"Validation": validation.name, "Passed": validation.passed, **validation.metrics}
-    )
-pd.DataFrame(validation_rows).set_index("Validation").fillna("")
+    for metric, value in validation.metrics.items():
+        validation_rows.append(
+            {
+                "Validation": validation.name,
+                "Passed": validation.passed,
+                "Metric": metric,
+                "Value": value,
+            }
+        )
+pd.DataFrame(validation_rows).style.format({"Value": "{:.6g}"})
 ```
 
 ## Customize the analysis
@@ -523,7 +593,7 @@ factor_model = resid.RecursiveMarketBetaModel(
     name="MKT",
 )
 residualizer = resid.SequentialOLSResidualizer(
-    factor_order=("MKT", "SMB", "HML", "VOLATILITY", "MOM"),
+    factor_order=("MKT", "SIZE", "HML", "VOLATILITY", "MOM"),
     winsor_quantile=0.01,
     unscaled_factors=("MKT",),
 )

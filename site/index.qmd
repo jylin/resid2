@@ -27,38 +27,30 @@ uv sync
 
 ## CLI
 
-The evaluated command uses:
-
-- a daily top-1,000 universe selected from the previous close;
-- sequential OLS over MKT, SMB, HML, and MOM; and
-- coverage, finite-output, reconstruction, and orthogonality checks.
-
 ```bash
-uv run resid \
-  --data-dir ../marcap/data \
-  --output-dir output/full \
-  --universe-method daily \
-  --output-years 10 \
-  --universe-size 1000 \
-  --momentum-lookback-days 189 \
-  --momentum-skip-days 63 \
-  --momentum-min-periods 126 \
-  --value-lookback-days 1008 \
-  --value-skip-days 252 \
-  --value-min-periods 756 \
-  --market-beta \
-  --market-beta-lookback-days 252 \
-  --market-beta-min-periods 126 \
-  --market-beta-decay 0.97 \
-  --regression-method ols \
-  --winsor-quantile 0.01 \
-  --minimum-date-coverage 0.99 \
-  --validation-tolerance 1e-12
+uv run resid ../marcap/data --config resid.toml
 ```
 
-Omit `--end-date` to use the latest local observation. Use
-`--universe-method fixed` for a first-day snapshot. See every option with
-`uv run resid --help`.
+The positional data path is required. CLI values override matching TOML fields.
+
+A compact configuration has this shape:
+
+```toml
+[run]
+years = 10
+
+[universe]
+method = "daily"
+size = 1000
+
+[factors]
+order = ["MKT", "SIZE", "HML", "MOM"]
+
+[regression]
+method = "ols"
+```
+
+See `uv run resid --help` for all overrides.
 
 ### Outputs
 
@@ -66,13 +58,13 @@ The CSV files use standard factor-model notation:
 
 | Notation | File | Contents | Schema |
 |---|---|---|---|
-| ε | `epsilon.csv` | Specific returns | `(date, ticker, specific_return)` |
+| ε | `epsilon.csv` | Residual returns | `(date, ticker, specific_return)` |
 | r | `r.csv` | Returns used by the regression | `(date, ticker, return)` |
 | X | `X.csv` | Normalized exposures | `(date, ticker, <one column per factor>)` |
 | f | `f.csv` | Daily factor returns | `(date, <one column per factor>)` |
 
 `epsilon.csv` is the primary output. The other files support reconstruction
-and diagnosis. X and f store `INTERCEPT`, `MKT`, `SMB`, `HML`, and `MOM` in
+and diagnosis. X and f store `INTERCEPT`, `MKT`, `SIZE`, `HML`, and `MOM` in
 removal order, with `r = Xf + ε`.
 
 Ticker values are zero-padded strings:
@@ -93,7 +85,7 @@ import resid
 source = resid.MarcapDataSource(Path("../marcap/data"))
 base_model = resid.CharacteristicFactorModel(
     (
-        resid.size_factor(name="SMB", small_minus_big=True),
+        resid.size_factor(name="SIZE"),
         resid.long_term_reversal_factor(
             lookback_days=1008,
             skip_days=252,
@@ -123,7 +115,7 @@ result = resid.run_pipeline(
     return_calculator=resid.PercentageReturns(),
     factor_model=factor_model,
     residualizer=resid.SequentialOLSResidualizer(
-        factor_order=("MKT", "SMB", "HML", "MOM"),
+        factor_order=("MKT", "SIZE", "HML", "MOM"),
         winsor_quantile=0.01,
         unscaled_factors=("MKT",),
     ),
@@ -141,10 +133,6 @@ resid.CsvArtifactWriter().write(result, Path("output/full"))
 Key choices:
 
 - Factor order sets attribution priority; changing it changes the model.
-- MKT stays in beta units through `unscaled_factors`; the styles use
-  standardized exposures.
-- `RecursiveMarketBetaModel` adds stateful beta to the style model. Use the
-  style model directly to omit it.
 - Sequential WLS and joint OLS are available behind the same residualizer
   boundary.
 
@@ -158,6 +146,3 @@ Key choices:
 | Exposures | DataFrame indexed by `(date, ticker)`, one column per factor |
 | Regression weights | Positive Series indexed by `(date, ticker)` |
 | Result | `ResidualizationResult` with ε, r, X, f, weights, diagnostics, universe, and validation results |
-
-ty checks the callable interfaces; integration tests cover the DataFrame
-schemas.

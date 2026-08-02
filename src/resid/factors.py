@@ -101,14 +101,12 @@ class _StaticFactorModel:
         del date, fit
 
 
-def size_factor(name: str, *, small_minus_big: bool = False) -> Factor:
-    """Lagged log market cap, optionally signed as small minus big."""
+def size_factor(name: str) -> Factor:
+    """Lagged log market cap; larger names have higher exposure."""
 
     def build(_: pd.DataFrame, market_caps: pd.DataFrame) -> pd.DataFrame:
         lagged = market_caps.shift(1).where(lambda values: values > 0)
         values = np.log(lagged.to_numpy())
-        if small_minus_big:
-            values = -values
         return pd.DataFrame(values, index=lagged.index, columns=lagged.columns)
 
     return Factor(name, build, history_business_days=1)

@@ -1,0 +1,38 @@
+# One explicit run configuration. Copy this file for another experiment.
+
+[run]
+years = 10
+
+[output]
+directory = "output/full"
+
+[universe]
+method = "daily"
+size = 1000
+
+[factors]
+order = ["MKT", "SIZE", "HML", "MOM"]
+
+[factors.momentum]
+lookback_days = 189
+skip_days = 63
+min_periods = 126
+
+[factors.value]
+lookback_days = 1008
+skip_days = 252
+min_periods = 756
+
+[factors.market_beta]
+enabled = true
+lookback_days = 252
+min_periods = 126
+decay = 0.97
+
+[regression]
+method = "ols"
+winsor_quantile = 0.01
+
+[validation]
+minimum_date_coverage = 0.99
+tolerance = 1e-12

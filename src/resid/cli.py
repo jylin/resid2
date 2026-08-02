@@ -1,7 +1,11 @@
 """Command-line entry point."""
 
 import argparse
+import tomllib
 from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from resid.artifacts import CsvArtifactWriter
 from resid.data import (
@@ -33,84 +37,220 @@ from resid.validation import (
 from resid.weights import EqualRegressionWeights, SquareRootMarketCapWeights
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Residualize returns with a configurable marcap model"
-    )
-    parser.add_argument("--data-dir", type=Path, default=Path("../marcap/data"))
-    parser.add_argument("--output-dir", type=Path, default=Path("output"))
-    parser.add_argument("--end-date", help="Optional YYYY-MM-DD output endpoint")
-    parser.add_argument("--universe-method", choices=("fixed", "daily"), required=True)
-    parser.add_argument("--universe-size", type=int, default=1000)
-    parser.add_argument("--output-years", type=int, default=1)
-    parser.add_argument("--momentum-lookback-days", type=int, default=189)
-    parser.add_argument("--momentum-skip-days", type=int, default=63)
-    parser.add_argument("--momentum-min-periods", type=int, default=126)
-    parser.add_argument("--value-lookback-days", type=int, default=1008)
-    parser.add_argument("--value-skip-days", type=int, default=252)
-    parser.add_argument("--value-min-periods", type=int, default=756)
-    parser.add_argument("--market-beta", action="store_true")
-    parser.add_argument("--market-beta-lookback-days", type=int, default=252)
-    parser.add_argument("--market-beta-min-periods", type=int, default=126)
-    parser.add_argument("--market-beta-decay", type=float, default=0.97)
+class _ConfigModel(BaseModel):
+    """Reject misspelled TOML keys instead of silently ignoring them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RunConfig(_ConfigModel):
+    years: int = Field(gt=0)
+    end_date: str | None = None
+
+
+class OutputConfig(_ConfigModel):
+    directory: Path
+
+
+class UniverseConfig(_ConfigModel):
+    method: Literal["fixed", "daily"]
+    size: int = Field(gt=0)
+
+
+class FactorWindowConfig(_ConfigModel):
+    lookback_days: int = Field(gt=0)
+    skip_days: int = Field(gt=0)
+    min_periods: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def periods_fit_window(self) -> FactorWindowConfig:
+        if self.min_periods > self.lookback_days:
+            raise ValueError("min_periods cannot exceed lookback_days")
+        return self
+
+
+class MarketBetaConfig(_ConfigModel):
+    enabled: bool
+    lookback_days: int = Field(gt=0)
+    min_periods: int = Field(gt=0)
+    decay: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def periods_fit_window(self) -> MarketBetaConfig:
+        if self.min_periods > self.lookback_days:
+            raise ValueError("min_periods cannot exceed lookback_days")
+        return self
+
+
+class FactorsConfig(_ConfigModel):
+    order: tuple[str, ...]
+    momentum: FactorWindowConfig
+    value: FactorWindowConfig
+    market_beta: MarketBetaConfig
+
+    @model_validator(mode="after")
+    def order_matches_factors(self) -> FactorsConfig:
+        expected = {"SIZE", "HML", "MOM"}
+        if self.market_beta.enabled:
+            expected.add("MKT")
+        if len(self.order) != len(set(self.order)) or set(self.order) != expected:
+            raise ValueError(f"order must contain exactly {sorted(expected)}")
+        return self
+
+
+class RegressionConfig(_ConfigModel):
+    method: Literal["ols", "sqrt-cap-wls"]
+    winsor_quantile: float = Field(ge=0, lt=0.5)
+
+
+class ValidationConfig(_ConfigModel):
+    minimum_date_coverage: float = Field(gt=0, le=1)
+    tolerance: float = Field(gt=0)
+
+
+class CliConfig(_ConfigModel):
+    """Complete, explicit run configuration loaded from TOML."""
+
+    run: RunConfig
+    output: OutputConfig
+    universe: UniverseConfig
+    factors: FactorsConfig
+    regression: RegressionConfig
+    validation: ValidationConfig
+
+
+def load_config(path: Path) -> CliConfig:
+    """Load and validate a hierarchical TOML run configuration."""
+
+    with path.open("rb") as stream:
+        return CliConfig.model_validate(tomllib.load(stream))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Residualize returns")
+    parser.add_argument("data_dir", type=Path, help="marcap data directory")
+    parser.add_argument("--config", type=Path, required=True, help="TOML defaults")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--end-date")
+    parser.add_argument("--years", type=int)
+    parser.add_argument("--universe-method", choices=("fixed", "daily"))
+    parser.add_argument("--universe-size", type=int)
+    parser.add_argument("--factor-order", nargs="+")
+    parser.add_argument("--momentum-lookback-days", type=int)
+    parser.add_argument("--momentum-skip-days", type=int)
+    parser.add_argument("--momentum-min-periods", type=int)
+    parser.add_argument("--value-lookback-days", type=int)
+    parser.add_argument("--value-skip-days", type=int)
+    parser.add_argument("--value-min-periods", type=int)
     parser.add_argument(
-        "--regression-method",
-        choices=("ols", "sqrt-cap-wls"),
-        required=True,
+        "--market-beta",
+        dest="market_beta_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
-    parser.add_argument("--winsor-quantile", type=float, default=0.01)
-    parser.add_argument("--minimum-date-coverage", type=float, default=0.95)
-    parser.add_argument("--validation-tolerance", type=float, default=1e-12)
+    parser.add_argument("--market-beta-lookback-days", type=int)
+    parser.add_argument("--market-beta-min-periods", type=int)
+    parser.add_argument("--market-beta-decay", type=float)
+    parser.add_argument("--regression-method", choices=("ols", "sqrt-cap-wls"))
+    parser.add_argument("--winsor-quantile", type=float)
+    parser.add_argument("--minimum-date-coverage", type=float)
+    parser.add_argument("--validation-tolerance", type=float)
+    return parser
+
+
+def apply_cli_overrides(config: CliConfig, args: argparse.Namespace) -> CliConfig:
+    """Apply non-empty CLI values over a validated TOML configuration."""
+
+    values = config.model_dump(mode="python")
+    overrides = (
+        ("run", "years", args.years),
+        ("run", "end_date", args.end_date),
+        ("output", "directory", args.output_dir),
+        ("universe", "method", args.universe_method),
+        ("universe", "size", args.universe_size),
+        ("regression", "method", args.regression_method),
+        ("regression", "winsor_quantile", args.winsor_quantile),
+        ("validation", "minimum_date_coverage", args.minimum_date_coverage),
+        ("validation", "tolerance", args.validation_tolerance),
+    )
+    for section, name, value in overrides:
+        if value is not None:
+            values[section][name] = value
+    if args.factor_order is not None:
+        values["factors"]["order"] = tuple(args.factor_order)
+
+    factor_overrides = (
+        ("momentum", "lookback_days", args.momentum_lookback_days),
+        ("momentum", "skip_days", args.momentum_skip_days),
+        ("momentum", "min_periods", args.momentum_min_periods),
+        ("value", "lookback_days", args.value_lookback_days),
+        ("value", "skip_days", args.value_skip_days),
+        ("value", "min_periods", args.value_min_periods),
+        ("market_beta", "enabled", args.market_beta_enabled),
+        ("market_beta", "lookback_days", args.market_beta_lookback_days),
+        ("market_beta", "min_periods", args.market_beta_min_periods),
+        ("market_beta", "decay", args.market_beta_decay),
+    )
+    for section, name, value in factor_overrides:
+        if value is not None:
+            values["factors"][section][name] = value
+    return CliConfig.model_validate(values)
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
+    try:
+        config = apply_cli_overrides(load_config(args.config), args)
+    except (OSError, tomllib.TOMLDecodeError, ValidationError, ValueError) as exc:
+        parser.error(f"invalid config or override: {exc}")
 
     source = MarcapDataSource(args.data_dir)
-    window = analysis_window(source, years=args.output_years, end=args.end_date)
+    window = analysis_window(source, years=config.run.years, end=config.run.end_date)
     base_factor_model = CharacteristicFactorModel(
         (
-            size_factor(name="SMB", small_minus_big=True),
+            size_factor(name="SIZE"),
             long_term_reversal_factor(
-                lookback_days=args.value_lookback_days,
-                skip_days=args.value_skip_days,
-                min_periods=args.value_min_periods,
+                lookback_days=config.factors.value.lookback_days,
+                skip_days=config.factors.value.skip_days,
+                min_periods=config.factors.value.min_periods,
                 name="HML",
             ),
             momentum_factor(
-                lookback_days=args.momentum_lookback_days,
-                skip_days=args.momentum_skip_days,
-                min_periods=args.momentum_min_periods,
+                lookback_days=config.factors.momentum.lookback_days,
+                skip_days=config.factors.momentum.skip_days,
+                min_periods=config.factors.momentum.min_periods,
                 name="MOM",
             ),
         )
     )
     factor_model: FactorModel = base_factor_model
-    if args.market_beta:
+    if config.factors.market_beta.enabled:
         factor_model = RecursiveMarketBetaModel(
             base=base_factor_model,
-            lookback_days=args.market_beta_lookback_days,
-            min_periods=args.market_beta_min_periods,
-            decay=args.market_beta_decay,
+            lookback_days=config.factors.market_beta.lookback_days,
+            min_periods=config.factors.market_beta.min_periods,
+            decay=config.factors.market_beta.decay,
             name="MKT",
         )
     universe_builder = (
-        DailyTopMarketCapUniverse(size=args.universe_size)
-        if args.universe_method == "daily"
-        else FixedTopMarketCapUniverse(size=args.universe_size)
+        DailyTopMarketCapUniverse(size=config.universe.size)
+        if config.universe.method == "daily"
+        else FixedTopMarketCapUniverse(size=config.universe.size)
     )
-    factor_order = (
-        ("MKT", "SMB", "HML", "MOM") if args.market_beta else ("SMB", "HML", "MOM")
-    )
-    unscaled_factors = ("MKT",) if args.market_beta else ()
-    if args.regression_method == "sqrt-cap-wls":
+    factor_order = config.factors.order
+    unscaled_factors = ("MKT",) if config.factors.market_beta.enabled else ()
+    if config.regression.method == "sqrt-cap-wls":
         residualizer = SequentialWLSResidualizer(
             factor_order=factor_order,
-            winsor_quantile=args.winsor_quantile,
+            winsor_quantile=config.regression.winsor_quantile,
             unscaled_factors=unscaled_factors,
         )
         regression_weight_model = SquareRootMarketCapWeights()
     else:
         residualizer = SequentialOLSResidualizer(
             factor_order=factor_order,
-            winsor_quantile=args.winsor_quantile,
+            winsor_quantile=config.regression.winsor_quantile,
             unscaled_factors=unscaled_factors,
         )
         regression_weight_model = EqualRegressionWeights()
@@ -124,25 +264,25 @@ def main() -> None:
         regression_weight_model=regression_weight_model,
         validations=(
             RegressionCoverageValidation(
-                minimum_date_coverage=args.minimum_date_coverage
+                minimum_date_coverage=config.validation.minimum_date_coverage
             ),
             FiniteOutputValidation(),
             ReturnReconstructionValidation(
-                absolute_tolerance=args.validation_tolerance
+                absolute_tolerance=config.validation.tolerance
             ),
             SequentialOrthogonalityValidation(
-                absolute_tolerance=args.validation_tolerance
+                absolute_tolerance=config.validation.tolerance
             ),
         ),
     )
-    manifest = CsvArtifactWriter().write(result, args.output_dir)
+    manifest = CsvArtifactWriter().write(result, config.output.directory)
     dates = result.factor_returns["date"]
     observations = result.diagnostics["n_observations"]
     print(
         f"{len(dates)} regressions from {dates.min().date()} to "
         f"{dates.max().date()} with {int(observations.min())}-"
         f"{int(observations.max())} usable names/day "
-        f"({args.universe_size} target)"
+        f"({config.universe.size} target)"
     )
     print(
         "validations: "

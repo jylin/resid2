@@ -153,7 +153,7 @@ def test_factor_exposures_do_not_use_current_return() -> None:
     )
 
 
-def test_smb_and_long_term_reversal_directions() -> None:
+def test_size_and_long_term_reversal_directions() -> None:
     dates = pd.date_range("2025-01-02", periods=6, freq="B")
     returns = pd.DataFrame(
         {"SMALL": [0.01] * len(dates), "BIG": [-0.01] * len(dates)},
@@ -164,7 +164,7 @@ def test_smb_and_long_term_reversal_directions() -> None:
         index=dates,
     )
 
-    smb = size_factor(name="SMB", small_minus_big=True).build(returns, market_caps)
+    size = size_factor(name="SIZE").build(returns, market_caps)
     hml_factor = long_term_reversal_factor(
         lookback_days=3,
         skip_days=1,
@@ -174,7 +174,7 @@ def test_smb_and_long_term_reversal_directions() -> None:
     hml = hml_factor.build(returns, market_caps)
 
     assert hml_factor.history_business_days == 4
-    assert smb.loc[dates[-1], "SMALL"] > smb.loc[dates[-1], "BIG"]
+    assert size.loc[dates[-1], "SMALL"] < size.loc[dates[-1], "BIG"]
     assert hml.loc[dates[-1], "SMALL"] < hml.loc[dates[-1], "BIG"]
 
 

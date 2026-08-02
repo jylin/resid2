@@ -1,6 +1,10 @@
 project:
   type: website
   output-dir: _site
+  preview:
+    port: 4200
+    browser: false
+    host: "0.0.0.0"
 
 execute:
   freeze: auto

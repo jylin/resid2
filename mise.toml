@@ -26,6 +26,5 @@ ruff format --no-cache src tests
 [tasks.site]
 run = "quarto render site"
 
-[tasks.site-preview]
-description = "Keep the Quarto preview running on a stable local URL"
-run = "quarto preview site --no-browser --host 0.0.0.0"
+[tasks.preview]
+run = "quarto preview site"
