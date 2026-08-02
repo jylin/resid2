@@ -27,7 +27,7 @@ jobs:
           version: 1.10.18
 
       - name: Render site
-        run: quarto render site -M freeze:true
+        run: quarto render site
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6

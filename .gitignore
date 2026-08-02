@@ -1,6 +1,9 @@
-.venv/
-__pycache__/
-.pytest_cache/
-output/
-/docs/
+/.pytest_cache/
+/.venv/
+/output/
+/site/*_files/
+/site/.gitignore
+/site/.quarto/
 /site/_site/
+/site/site_libs/
+__pycache__/

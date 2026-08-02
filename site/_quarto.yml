@@ -7,7 +7,7 @@ project:
     host: "0.0.0.0"
 
 execute:
-  freeze: auto
+  freeze: true
 
 website:
   title: resid

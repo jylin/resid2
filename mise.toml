@@ -26,5 +26,8 @@ ruff format --no-cache src tests
 [tasks.site]
 run = "quarto render site"
 
+[tasks.refresh]
+run = "quarto render site --execute"
+
 [tasks.preview]
 run = "quarto preview site"
