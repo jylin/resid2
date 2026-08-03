@@ -62,7 +62,6 @@ class ReturnObserved(_Event):
     ticker: str = Field(min_length=1)
     effective_at: datetime
     return_value: float
-    revision: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def known_after_effective(self) -> ReturnObserved:

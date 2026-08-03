@@ -34,7 +34,11 @@ from resid.validation import (
     ReturnReconstructionValidation,
     SequentialOrthogonalityValidation,
 )
-from resid.weights import EqualRegressionWeights, SquareRootMarketCapWeights
+from resid.weights import (
+    EqualRegressionWeights,
+    RegressionWeightModel,
+    SquareRootMarketCapWeights,
+)
 
 
 class _ConfigModel(BaseModel):
@@ -73,7 +77,9 @@ class MarketBetaConfig(_ConfigModel):
     enabled: bool
     lookback_days: int = Field(gt=0)
     min_periods: int = Field(gt=0)
-    decay: float = Field(gt=0, le=1)
+    # Must match RecursiveMarketBetaModel.decay: 1.0 never forgets, so the model
+    # itself rejects it, and accepting it here would defer that to a raw traceback.
+    decay: float = Field(gt=0, lt=1)
 
     @model_validator(mode="after")
     def periods_fit_window(self) -> MarketBetaConfig:
@@ -99,6 +105,13 @@ class FactorsConfig(_ConfigModel):
 
 
 class RegressionConfig(_ConfigModel):
+    """Both methods remove factors sequentially in `factors.order`.
+
+    `ols` weights every name equally; `sqrt-cap-wls` weights by the square root of
+    prior-session market cap. Neither is a single multivariate fit — for that, call
+    `run_pipeline` directly with `OLSResidualizer`.
+    """
+
     method: Literal["ols", "sqrt-cap-wls"]
     winsor_quantile: float = Field(ge=0, lt=0.5)
 
@@ -151,7 +164,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-beta-lookback-days", type=int)
     parser.add_argument("--market-beta-min-periods", type=int)
     parser.add_argument("--market-beta-decay", type=float)
-    parser.add_argument("--regression-method", choices=("ols", "sqrt-cap-wls"))
+    parser.add_argument(
+        "--regression-method",
+        choices=("ols", "sqrt-cap-wls"),
+        help="sequential removal weighting: equal (ols) or sqrt market cap",
+    )
     parser.add_argument("--winsor-quantile", type=float)
     parser.add_argument("--minimum-date-coverage", type=float)
     parser.add_argument("--validation-tolerance", type=float)
@@ -240,13 +257,14 @@ def main() -> None:
     )
     factor_order = config.factors.order
     unscaled_factors = ("MKT",) if config.factors.market_beta.enabled else ()
+    residualizer: SequentialOLSResidualizer | SequentialWLSResidualizer
     if config.regression.method == "sqrt-cap-wls":
         residualizer = SequentialWLSResidualizer(
             factor_order=factor_order,
             winsor_quantile=config.regression.winsor_quantile,
             unscaled_factors=unscaled_factors,
         )
-        regression_weight_model = SquareRootMarketCapWeights()
+        regression_weight_model: RegressionWeightModel = SquareRootMarketCapWeights()
     else:
         residualizer = SequentialOLSResidualizer(
             factor_order=factor_order,

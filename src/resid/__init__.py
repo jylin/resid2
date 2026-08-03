@@ -9,6 +9,11 @@ from resid.data import (
     MarketDataSource,
     UniverseBuilder,
     analysis_window,
+    history_start,
+    previous_session_values,
+    universe_dates,
+    universe_index,
+    universe_members,
 )
 from resid.events import (
     EventLog,
@@ -35,6 +40,7 @@ from resid.pipeline import run_pipeline
 from resid.regression import (
     CrossSectionFit,
     IncrementalRegression,
+    IncrementalResidualizer,
     OLSResidualizer,
     RegressionValidationResult,
     ResidualizationResult,

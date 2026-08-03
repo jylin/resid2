@@ -26,6 +26,7 @@ from resid import (
     SequentialWLSResidualizer,
     SquareRootMarketCapWeights,
     historical_events,
+    history_start,
     run_pipeline,
 )
 
@@ -220,8 +221,11 @@ def test_logged_live_replay_matches_vectorized_recursive_model(tmp_path: Path) -
 
     universe = FixedTopMarketCapUniverse(size=len(tickers)).build(source, window)
     model = factor_model()
-    history_start = window.start - pd.offsets.BDay(model.history_business_days)
-    market_data = source.load(history_start, window.end)
+    # Must match run_pipeline's own history span, or the hand-built model below
+    # bootstraps beta from a different slice of history than the batch run did.
+    market_data = source.load(
+        history_start(window.start, model.history_business_days), window.end
+    )
     returns = PercentageReturns().calculate(market_data)
     regression_weights = SquareRootMarketCapWeights().calculate(market_data)
     prepared = model.prepare(market_data, returns, universe)

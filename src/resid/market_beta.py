@@ -7,6 +7,12 @@ import pandas as pd
 from pydantic import ConfigDict, Field, SkipValidation
 from pydantic.dataclasses import dataclass
 
+from resid.data import (
+    previous_session_values,
+    universe_dates,
+    universe_index,
+    universe_members,
+)
 from resid.factors import FactorModel, PreparedFactorModel
 from resid.regression import CrossSectionFit
 
@@ -20,9 +26,18 @@ class RecursiveMarketBetaModel:
     """Add market beta using prior state, then update it after each daily fit.
 
     Exposures are raw betas on the same scale as the bootstrap and the
-    `initial_beta` prior, and `update` inverts the regression's normalization so
-    the recursion stays on that scale. Naming this factor in the residualizer's
-    `unscaled_factors` keeps its reported slope in per-unit-beta return terms.
+    `initial_beta` prior, and `update` restores the level the regression centered
+    away so the recursion stays on that scale. Naming this factor in the
+    residualizer's `unscaled_factors` keeps its reported slope in per-unit-beta
+    return terms; the recursion itself is invariant to that choice, because a
+    rescaled exposure earns a reciprocally rescaled factor return.
+
+    `prior_variance` is a weight in units of squared market return, so it is
+    directly comparable to the `market_return ** 2` a single session contributes.
+    The default is about one session's worth against a steady state of
+    `market_return ** 2 / (1 - decay)`, which makes the bootstrap a tie-breaker
+    for the first few sessions rather than a lasting prior. Raise it to hold the
+    bootstrapped level for longer.
     """
 
     base: SkipValidation[FactorModel]
@@ -82,7 +97,7 @@ class RecursiveMarketBetaModel:
         return _weighted_market_returns(
             returns,
             market_data["market_cap"],
-            index=universe.index[universe],
+            index=universe_index(universe),
         )
 
     def _initial_state(
@@ -91,9 +106,8 @@ class RecursiveMarketBetaModel:
         returns: pd.Series,
         universe: pd.Series,
     ) -> tuple[dict[str, float], dict[str, float]]:
-        analysis_start = pd.Timestamp(universe.index.get_level_values("date").min())
-        initial_members = universe.xs(analysis_start, level="date")
-        initial_tickers = initial_members.index[initial_members.to_numpy(dtype="bool")]
+        analysis_start = universe_dates(universe)[0]
+        initial_tickers = universe_members(universe, analysis_start)
         initial_index = returns.index[
             returns.index.get_level_values("ticker").isin(initial_tickers)
         ]
@@ -103,9 +117,12 @@ class RecursiveMarketBetaModel:
         )
         market_returns = market_returns.loc[market_returns.index < analysis_start]
 
-        weights = _lagged_market_caps(market_data["market_cap"])
         history = pd.concat(
-            [returns.rename("asset_return"), weights.rename("weight")], axis=1
+            [
+                returns.rename("asset_return"),
+                previous_session_values(market_data["market_cap"]).rename("weight"),
+            ],
+            axis=1,
         )
         dates = history.index.get_level_values("date")
         history = history.loc[dates < analysis_start]
@@ -121,7 +138,7 @@ class RecursiveMarketBetaModel:
         tickers = returns.index.get_level_values("ticker").unique()
         initial_betas = {str(ticker): self.initial_beta for ticker in tickers}
         for ticker, observations in history.groupby(level="ticker", sort=False):
-            observations = observations.tail(self.lookback_days).dropna()
+            observations = observations.tail(self.lookback_days)
             if len(observations) < self.min_periods:
                 continue
             market = observations["market_return"].to_numpy(dtype="float64")
@@ -143,7 +160,7 @@ class RecursiveMarketBetaModel:
         return numerators, denominators
 
 
-@plain_dataclass(slots=True)
+@plain_dataclass(slots=True, eq=False)
 class _PreparedRecursiveMarketBeta:
     base: PreparedFactorModel
     name: str
@@ -170,23 +187,21 @@ class _PreparedRecursiveMarketBeta:
         factor_return = float(fit.factor_returns[self.name])
         market_return = float(self.market_returns.get(pd.Timestamp(date), np.nan))
         center = float(fit.exposure_centers[self.name])
-        scale = float(fit.exposure_scales[self.name])
         if not np.isfinite(factor_return) or not np.isfinite(market_return):
             return
         if not np.isfinite(center):
             return
-        if not np.isfinite(scale) or scale <= 0:
-            return
 
-        # The regression normalizes this column to x = (beta - center) / scale.
-        # Remove the fitted x * factor_return contribution, then restore the
-        # centered level with the observed market return. The observed return is
-        # the EWLS shock; the fitted cross-sectional premium is not a time-series
-        # market return and would feed the estimator back into its own state.
-        factor_fitted = fit.exposures[self.name] * factor_return
-        target_returns = (
-            fit.returns - (fit.fitted_returns - factor_fitted) + center * market_return
+        # Strip everything the cross-section attributed to other factors and to the
+        # intercept, leaving each name's market-attributable return, then restore the
+        # level the regression centered away using the *observed* market return. The
+        # result carries no dependence on the ticker's own beta, so regressing it on
+        # the market return cannot feed the estimator back into its own state.
+        non_market_fitted = (
+            fit.fitted_returns - fit.exposures[self.name] * factor_return
         )
+        target_returns = fit.returns - non_market_fitted + center * market_return
+        shock = market_return**2
         for ticker, target_return in target_returns.items():
             if not np.isfinite(target_return):
                 continue
@@ -195,7 +210,7 @@ class _PreparedRecursiveMarketBeta:
             numerator = self.numerators.get(
                 key, self.initial_beta * self.prior_variance
             )
-            denominator = self.decay * denominator + market_return**2
+            denominator = self.decay * denominator + shock
             numerator = self.decay * numerator + market_return * float(target_return)
             # Write the bounded beta back rather than clipping on read. Keeping the
             # raw ratio in state lets it wander far outside the bounds and recover
@@ -216,19 +231,18 @@ class _PreparedRecursiveMarketBeta:
         return numerator / denominator
 
 
-def _lagged_market_caps(market_caps: pd.Series) -> pd.Series:
-    return market_caps.groupby(level="ticker").shift(1)
-
-
 def _weighted_market_returns(
     returns: pd.Series,
     market_caps: pd.Series,
     *,
     index: pd.Index | None = None,
 ) -> pd.Series:
-    lagged_caps = _lagged_market_caps(market_caps)
     observations = pd.concat(
-        [returns.rename("asset_return"), lagged_caps.rename("weight")], axis=1
+        [
+            returns.rename("asset_return"),
+            previous_session_values(market_caps).rename("weight"),
+        ],
+        axis=1,
     )
     if index is not None:
         observations = observations.reindex(index)

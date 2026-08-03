@@ -27,7 +27,10 @@ ruff format --no-cache src tests
 run = "quarto render site"
 
 [tasks.refresh]
-run = "quarto render site --execute"
+run = """
+quarto render site/walkthrough.qmd
+quarto render site
+"""
 
 [tasks.preview]
 run = "quarto preview site"

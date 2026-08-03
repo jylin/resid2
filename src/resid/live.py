@@ -7,6 +7,7 @@ from typing import Literal, cast
 import numpy as np
 import pandas as pd
 
+from resid.data import universe_dates, universe_members
 from resid.events import (
     EventLog,
     LiveEvent,
@@ -20,13 +21,11 @@ from resid.factors import PreparedFactorModel
 from resid.regression import (
     CrossSectionFit,
     IncrementalRegression,
-    OLSResidualizer,
-    SequentialOLSResidualizer,
-    SequentialWLSResidualizer,
+    IncrementalResidualizer,
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class LivePeriodResult:
     """One provisional or authoritative live cross-sectional result."""
 
@@ -38,14 +37,14 @@ class LivePeriodResult:
     fit: CrossSectionFit
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _ActivePeriod:
     key: PeriodKey
     regression: IncrementalRegression
     revision: int = 0
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class LiveRegressionRunner:
     """Consume logged return events and advance factor state only at close."""
 
@@ -53,9 +52,7 @@ class LiveRegressionRunner:
     market: str
     interval: str
     factors: PreparedFactorModel
-    residualizer: (
-        OLSResidualizer | SequentialOLSResidualizer | SequentialWLSResidualizer
-    )
+    residualizer: IncrementalResidualizer
     _active: _ActivePeriod | None = field(init=False, default=None, repr=False)
     _last_offset: int = field(init=False, default=0, repr=False)
 
@@ -89,11 +86,14 @@ class LiveRegressionRunner:
         self._check_key(event.key)
 
         if isinstance(event, PeriodOpened):
-            result = self._open(event)
+            self._open(event)
+            result = None
         elif isinstance(event, ReturnObserved):
             result = self._observe(logged.offset, event)
-        else:
+        elif isinstance(event, PeriodClosed):
             result = self._close(logged.offset, event)
+        else:
+            raise TypeError(f"unsupported event kind: {event.kind}")
         self._last_offset = logged.offset
         return result
 
@@ -197,13 +197,10 @@ def historical_events(
     """Expose finalized historical returns through the canonical live event schema."""
 
     sequence = 0
-    dates = universe.loc[universe].index.get_level_values("date").unique().sort_values()
-    for date in dates:
-        timestamp = pd.Timestamp(date)
-        as_of = cast(pd.Timestamp, timestamp).to_pydatetime()
+    for timestamp in universe_dates(universe):
+        as_of = timestamp.to_pydatetime()
         key = PeriodKey(market=market, interval=interval, as_of=as_of)
-        membership = universe.xs(timestamp, level="date")
-        tickers = membership.index[membership.to_numpy(dtype="bool")].astype(str)
+        tickers = universe_members(universe, timestamp).astype(str)
         day_weights = regression_weights.xs(timestamp, level="date").reindex(tickers)
         eligible = np.isfinite(day_weights) & day_weights.gt(0)
         tickers = tickers[eligible.to_numpy()]

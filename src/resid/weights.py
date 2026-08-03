@@ -6,6 +6,8 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
+from resid.data import previous_session_values
+
 
 class RegressionWeightModel(Protocol):
     @property
@@ -31,12 +33,10 @@ class SquareRootMarketCapWeights:
     history_business_days: int = 1
 
     def calculate(self, market_data: pd.DataFrame) -> pd.Series:
-        market_caps = market_data["market_cap"].unstack("ticker")
-        lagged = market_caps.shift(1).where(lambda values: values > 0)
-        values = np.sqrt(lagged.to_numpy(dtype="float64"))
-        index = pd.MultiIndex.from_product(
-            [lagged.index, lagged.columns], names=["date", "ticker"]
-        )
-        return pd.Series(values.ravel(), index=index, name="regression_weight").reindex(
-            market_data.index
+        lagged = previous_session_values(market_data["market_cap"])
+        positive = lagged.where(lagged > 0)
+        return pd.Series(
+            np.sqrt(positive.to_numpy(dtype="float64")),
+            index=positive.index,
+            name="regression_weight",
         )

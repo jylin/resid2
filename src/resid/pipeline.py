@@ -1,12 +1,18 @@
 """Explicit orchestration across the pipeline boundaries."""
 
-from dataclasses import replace
-from typing import cast
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
 
-from resid.data import AnalysisWindow, MarketDataSource, UniverseBuilder
+from resid.data import (
+    AnalysisWindow,
+    MarketDataSource,
+    UniverseBuilder,
+    history_start,
+    universe_dates,
+    universe_members,
+)
 from resid.factors import FactorModel, PreparedFactorModel
 from resid.regression import CrossSectionFit, ResidualizationResult, Residualizer
 from resid.returns import ReturnCalculator
@@ -29,12 +35,14 @@ def run_pipeline(
 
     universe = universe_builder.build(source, window)
     tickers = universe.index.get_level_values("ticker").unique()
-    history_days = max(
-        factor_model.history_business_days,
-        regression_weight_model.history_business_days,
+    start = history_start(
+        window.start,
+        max(
+            factor_model.history_business_days,
+            regression_weight_model.history_business_days,
+        ),
     )
-    history_start = window.start - pd.offsets.BDay(history_days)
-    market_data = source.load(history_start, window.end, tickers)
+    market_data = source.load(start, window.end, tickers)
     returns = return_calculator.calculate(market_data)
     prepared = factor_model.prepare(market_data, returns, universe)
     regression_weights = regression_weight_model.calculate(market_data)
@@ -50,6 +58,71 @@ def run_pipeline(
     return result
 
 
+@dataclass(slots=True, eq=False)
+class _Artifacts:
+    """Accumulate one row group per completed daily fit."""
+
+    model_columns: tuple[str, ...] | None = None
+    exposures: list[pd.DataFrame] = field(default_factory=list)
+    returns: list[pd.DataFrame] = field(default_factory=list)
+    specific_returns: list[pd.DataFrame] = field(default_factory=list)
+    regression_weights: list[pd.DataFrame] = field(default_factory=list)
+    factor_returns: list[dict[str, object]] = field(default_factory=list)
+    diagnostics: list[dict[str, object]] = field(default_factory=list)
+
+    def add(self, date: pd.Timestamp, fit: CrossSectionFit) -> None:
+        columns = tuple(str(name) for name in fit.factor_returns.index)
+        if self.model_columns is None:
+            self.model_columns = columns
+        elif self.model_columns != columns:
+            raise ValueError("residualizer changed model columns between dates")
+
+        date_column = np.repeat(date.to_datetime64(), len(fit.returns))
+        ticker_column = fit.returns.index.astype("string")
+        keys = {"date": date_column, "ticker": ticker_column}
+
+        exposures = fit.exposures.copy()
+        exposures.insert(0, "INTERCEPT", 1.0)
+        exposures.insert(0, "ticker", ticker_column)
+        exposures.insert(0, "date", date_column)
+        self.exposures.append(exposures.reset_index(drop=True))
+        self.returns.append(pd.DataFrame({**keys, "return": fit.returns.to_numpy()}))
+        self.specific_returns.append(
+            pd.DataFrame({**keys, "specific_return": fit.specific_returns.to_numpy()})
+        )
+        self.regression_weights.append(
+            pd.DataFrame(
+                {**keys, "regression_weight": fit.regression_weights.to_numpy()}
+            )
+        )
+        self.factor_returns.append({"date": date, **fit.factor_returns.to_dict()})
+        self.diagnostics.append(
+            {
+                "date": date,
+                "n_observations": len(fit.returns),
+                "rank": fit.rank,
+                "r_squared": fit.r_squared,
+                "residual_mean": float(
+                    np.average(fit.specific_returns, weights=fit.regression_weights)
+                ),
+            }
+        )
+
+    def build(self, universe: pd.Series) -> ResidualizationResult:
+        if self.model_columns is None:
+            raise ValueError("no dates had enough valid observations to fit")
+        return ResidualizationResult(
+            specific_returns=pd.concat(self.specific_returns, ignore_index=True),
+            returns=pd.concat(self.returns, ignore_index=True),
+            exposures=pd.concat(self.exposures, ignore_index=True),
+            factor_returns=pd.DataFrame(self.factor_returns),
+            diagnostics=pd.DataFrame(self.diagnostics),
+            regression_weights=pd.concat(self.regression_weights, ignore_index=True),
+            universe=universe,
+            model_columns=self.model_columns,
+        )
+
+
 def _residualize(
     returns: pd.Series,
     factors: PreparedFactorModel,
@@ -57,107 +130,16 @@ def _residualize(
     regression_weights: pd.Series,
     universe: pd.Series,
 ) -> ResidualizationResult:
-    model_columns: tuple[str, ...] | None = None
-    exposure_rows: list[pd.DataFrame] = []
-    return_rows: list[pd.DataFrame] = []
-    specific_rows: list[pd.DataFrame] = []
-    weight_rows: list[pd.DataFrame] = []
-    factor_return_rows: list[dict[str, object]] = []
-    diagnostic_rows: list[dict[str, object]] = []
-    dates = universe.loc[universe].index.get_level_values("date").unique().sort_values()
-
-    for date in dates:
-        date_value = cast(pd.Timestamp, pd.Timestamp(date))
-        membership = universe.xs(date_value, level="date")
-        tickers = membership.index[membership.to_numpy(dtype="bool")]
-        day_returns = returns.xs(date_value, level="date").reindex(tickers)
+    artifacts = _Artifacts()
+    for date in universe_dates(universe):
+        tickers = universe_members(universe, date)
         fit = residualizer.fit(
-            day_returns,
-            factors.exposures(date_value, tickers),
-            regression_weights.xs(date_value, level="date").reindex(tickers),
+            returns.xs(date, level="date").reindex(tickers),
+            factors.exposures(date, tickers),
+            regression_weights.xs(date, level="date").reindex(tickers),
         )
         if fit is None:
             continue
-
-        fit_columns = tuple(str(name) for name in fit.factor_returns.index)
-        if model_columns is None:
-            model_columns = fit_columns
-        elif model_columns != fit_columns:
-            raise ValueError("residualizer changed model columns between dates")
-
-        (
-            exposure_frame,
-            return_frame,
-            specific_frame,
-            weight_frame,
-            factor_return_row,
-            diagnostic_row,
-        ) = _fit_outputs(date_value, fit)
-        exposure_rows.append(exposure_frame)
-        return_rows.append(return_frame)
-        specific_rows.append(specific_frame)
-        weight_rows.append(weight_frame)
-        factor_return_rows.append(factor_return_row)
-        diagnostic_rows.append(diagnostic_row)
-        factors.update(date_value, fit)
-
-    if not factor_return_rows:
-        raise ValueError("no dates had enough valid observations to fit")
-    if model_columns is None:
-        raise RuntimeError("regression results are missing model columns")
-    return ResidualizationResult(
-        specific_returns=pd.concat(specific_rows, ignore_index=True),
-        returns=pd.concat(return_rows, ignore_index=True),
-        exposures=pd.concat(exposure_rows, ignore_index=True),
-        factor_returns=pd.DataFrame(factor_return_rows),
-        diagnostics=pd.DataFrame(diagnostic_rows),
-        regression_weights=pd.concat(weight_rows, ignore_index=True),
-        universe=universe,
-        model_columns=model_columns,
-    )
-
-
-def _fit_outputs(
-    date: pd.Timestamp,
-    fit: CrossSectionFit,
-) -> tuple[
-    pd.DataFrame,
-    pd.DataFrame,
-    pd.DataFrame,
-    pd.DataFrame,
-    dict[str, object],
-    dict[str, object],
-]:
-    """Convert one fit into the tabular artifacts accumulated by the pipeline."""
-
-    date_column = np.repeat(date.to_datetime64(), len(fit.returns))
-    ticker_column = fit.returns.index.astype("string")
-    used_exposures = fit.exposures.copy()
-    used_exposures.insert(0, "INTERCEPT", 1.0)
-    used_exposures.insert(0, "ticker", ticker_column)
-    used_exposures.insert(0, "date", date_column)
-    common = {"date": date_column, "ticker": ticker_column}
-    return (
-        used_exposures.reset_index(drop=True),
-        pd.DataFrame({**common, "return": fit.returns.to_numpy()}),
-        pd.DataFrame({**common, "specific_return": fit.specific_returns.to_numpy()}),
-        pd.DataFrame(
-            {
-                **common,
-                "regression_weight": fit.regression_weights.to_numpy(),
-            }
-        ),
-        {"date": date, **fit.factor_returns.to_dict()},
-        {
-            "date": date,
-            "n_observations": len(fit.returns),
-            "rank": fit.rank,
-            "r_squared": fit.r_squared,
-            "residual_mean": float(
-                np.average(
-                    fit.specific_returns,
-                    weights=fit.regression_weights,
-                )
-            ),
-        },
-    )
+        artifacts.add(date, fit)
+        factors.update(date, fit)
+    return artifacts.build(universe)

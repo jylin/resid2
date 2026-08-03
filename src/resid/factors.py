@@ -64,13 +64,18 @@ class CharacteristicFactorModel:
         market_caps = (
             market_data["market_cap"].unstack("ticker").reindex_like(wide_returns)
         )
-        matrices = {
-            factor.name: factor.build(wide_returns, market_caps)
-            for factor in self.factors
-        }
         index = pd.MultiIndex.from_product(
             [wide_returns.index, wide_returns.columns], names=["date", "ticker"]
         )
+        # Flattening assumes each builder's output is laid out exactly like
+        # wide_returns, so align rather than trust it: a builder that reindexes
+        # would otherwise scramble exposures across dates without any error.
+        matrices = {
+            factor.name: factor.build(wide_returns, market_caps).reindex(
+                index=wide_returns.index, columns=wide_returns.columns
+            )
+            for factor in self.factors
+        }
         return pd.DataFrame(
             {name: matrix.to_numpy().ravel() for name, matrix in matrices.items()},
             index=index,
@@ -86,7 +91,7 @@ class CharacteristicFactorModel:
         return _StaticFactorModel(self.exposures(market_data, returns))
 
 
-@plain_dataclass(frozen=True, slots=True)
+@plain_dataclass(frozen=True, slots=True, eq=False)
 class _StaticFactorModel:
     values: pd.DataFrame
 

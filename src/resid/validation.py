@@ -7,6 +7,7 @@ import pandas as pd
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 
+from resid.data import universe_dates
 from resid.regression import RegressionValidationResult, ResidualizationResult
 
 
@@ -26,9 +27,7 @@ class RegressionCoverageValidation:
     minimum_date_coverage: float = Field(ge=0, le=1)
 
     def validate(self, result: ResidualizationResult) -> RegressionValidationResult:
-        expected_dates = (
-            result.universe.loc[result.universe].index.get_level_values("date").unique()
-        )
+        expected_dates = universe_dates(result.universe)
         completed_dates = pd.DatetimeIndex(result.factor_returns["date"].unique())
         coverage = (
             len(completed_dates) / len(expected_dates) if len(expected_dates) else 0.0
