@@ -94,7 +94,11 @@ def test_incremental_ols_reconciles_to_canonical_fit(
         index=tickers,
         name="return",
     )
-    regression_weights = pd.Series(np.geomspace(1, 10, len(tickers)), index=tickers)
+    regression_weights = (
+        pd.Series(1.0, index=tickers)
+        if isinstance(residualizer, SequentialOLSResidualizer)
+        else pd.Series(np.geomspace(1, 10, len(tickers)), index=tickers)
+    )
     incremental = IncrementalRegression(
         residualizer, exposures, regression_weights, returns
     )

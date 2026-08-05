@@ -133,13 +133,19 @@ def _residualize(
     artifacts = _Artifacts()
     for date in universe_dates(universe):
         tickers = universe_members(universe, date)
+        day_returns = returns.xs(date, level="date").reindex(tickers)
+        day_exposures = factors.exposures(date, tickers)
+        day_weights = regression_weights.xs(date, level="date").reindex(tickers)
         fit = residualizer.fit(
-            returns.xs(date, level="date").reindex(tickers),
-            factors.exposures(date, tickers),
-            regression_weights.xs(date, level="date").reindex(tickers),
+            day_returns,
+            day_exposures,
+            day_weights,
         )
         if fit is None:
             continue
         artifacts.add(date, fit)
-        factors.update(date, fit)
+        # Preserve the public two-argument PreparedFactorModel API while giving
+        # stateful factors access to finite returns excluded by another factor's
+        # missing history.
+        factors.update(date, replace(fit, observed_returns=day_returns))
     return artifacts.build(universe)

@@ -32,6 +32,10 @@ class CrossSectionFit:
     r_squared: float
     exposure_centers: pd.Series
     exposure_scales: pd.Series
+    # The canonical fit contains only rows usable by every modeled factor.  A
+    # stateful factor may still need the full day's observed return vector when
+    # it advances its state, so the pipeline attaches it only for that update.
+    observed_returns: pd.Series | None = None
 
 
 @plain_dataclass(frozen=True, eq=False)
@@ -92,20 +96,27 @@ class OLSResidualizer:
         exposures: pd.DataFrame,
         regression_weights: pd.Series,
     ) -> CrossSectionFit | None:
-        del regression_weights
         factor_names = tuple(str(name) for name in exposures.columns)
         _validate_factor_names(factor_names, self.unscaled_factors, "factor names")
         model_columns = ("INTERCEPT", *factor_names)
         cross_section = pd.concat(
-            [returns.rename("return"), exposures], axis=1
+            [
+                returns.rename("return"),
+                exposures,
+                regression_weights.rename("regression_weight"),
+            ],
+            axis=1,
         ).dropna()
         cross_section = _finite_rows(cross_section)
+        cross_section = cross_section.loc[cross_section["regression_weight"] > 0]
         if len(cross_section) <= len(model_columns):
             return None
 
+        weights = cross_section["regression_weight"].astype("float64")
         normalized = _normalize(
             cross_section.loc[:, factor_names],
             self.winsor_quantile,
+            weights,
             unscaled_factors=self.unscaled_factors,
         )
         if normalized is None:
@@ -113,13 +124,21 @@ class OLSResidualizer:
 
         exposures_used = normalized.exposures
         target = cross_section.loc[exposures_used.index, "return"].astype("float64")
+        weights = weights.loc[exposures_used.index]
+        weight_values = weights.to_numpy(dtype="float64")
+        design = _design(exposures_used)
+        sqrt_weights = np.sqrt(weight_values)
         coefficients, _, rank, _ = np.linalg.lstsq(
-            _design(exposures_used), target.to_numpy(), rcond=None
+            design * sqrt_weights[:, None],
+            target.to_numpy() * sqrt_weights,
+            rcond=None,
         )
+        if int(rank) < len(model_columns):
+            return None
         return _cross_section_fit(
             target=target,
             normalized=normalized,
-            regression_weights=pd.Series(1.0, index=target.index),
+            regression_weights=weights,
             coefficients=coefficients,
             model_columns=model_columns,
             rank=int(rank),
@@ -130,8 +149,11 @@ class OLSResidualizer:
         exposures: pd.DataFrame,
         regression_weights: pd.Series,
     ) -> np.ndarray:
-        del regression_weights
-        return np.linalg.pinv(_design(exposures))
+        weights = _positive_weights(regression_weights, exposures.index)
+        sqrt_weights = np.sqrt(weights)
+        weighted_design = _design(exposures) * sqrt_weights[:, None]
+        # pinv(X sqrt(W)) sqrt(W) is the coefficient map for WLS.
+        return np.linalg.pinv(weighted_design) * sqrt_weights
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,11 +173,11 @@ class SequentialOLSResidualizer:
         exposures: pd.DataFrame,
         regression_weights: pd.Series,
     ) -> CrossSectionFit | None:
-        del regression_weights
+        weights = _uniform_weights(regression_weights, returns.index)
         return _fit_sequential(
             returns=returns,
             exposures=exposures,
-            regression_weights=pd.Series(1.0, index=returns.index),
+            regression_weights=weights,
             factor_order=self.factor_order,
             winsor_quantile=self.winsor_quantile,
             unscaled_factors=self.unscaled_factors,
@@ -166,9 +188,9 @@ class SequentialOLSResidualizer:
         exposures: pd.DataFrame,
         regression_weights: pd.Series,
     ) -> np.ndarray:
-        del regression_weights
+        weights = _uniform_weights(regression_weights, exposures.index)
         return _sequential_projection(
-            self.factor_order, exposures, np.ones(len(exposures))
+            self.factor_order, exposures, weights.to_numpy(dtype="float64")
         )
 
 
@@ -249,6 +271,19 @@ def _fit_sequential(
     )
     if normalized is None:
         return None
+
+    orthogonalized = _orthogonalize(
+        normalized.exposures,
+        factor_order,
+        weights.to_numpy(dtype="float64"),
+    )
+    if orthogonalized is None:
+        return None
+    normalized = _NormalizedExposures(
+        exposures=orthogonalized,
+        centers=normalized.centers,
+        scales=normalized.scales,
+    )
 
     exposures_used = normalized.exposures
     target = cross_section.loc[exposures_used.index, "return"].astype("float64")
@@ -476,6 +511,63 @@ def _normalize(
         centers=pd.Series(means, index=exposures.columns, name="exposure_center"),
         scales=pd.Series(scales, index=exposures.columns, name="exposure_scale"),
     )
+
+
+def _orthogonalize(
+    exposures: pd.DataFrame,
+    factor_order: tuple[str, ...],
+    weights: np.ndarray,
+) -> pd.DataFrame | None:
+    """Build a weighted orthogonal basis in the configured factor order.
+
+    The first factor keeps its centered/scaled values.  Each later factor is
+    residualized against all earlier basis vectors, making the resulting columns
+    mutually orthogonal under the regression weights.  Sequential removal on
+    this basis is therefore the joint WLS projection while retaining the order's
+    first-claim interpretation.
+    """
+
+    basis: list[np.ndarray] = []
+    for name in factor_order:
+        residual = exposures[name].to_numpy(dtype="float64", copy=True)
+        original_denominator = float(np.dot(weights * residual, residual))
+        for prior in basis:
+            denominator = float(np.dot(weights * prior, prior))
+            if not np.isfinite(denominator) or denominator <= 0:
+                return None
+            residual -= (np.dot(weights * residual, prior) / denominator) * prior
+        denominator = float(np.dot(weights * residual, residual))
+        tolerance = np.finfo("float64").eps * max(1.0, original_denominator) * 100
+        if not np.isfinite(denominator) or denominator <= tolerance:
+            return None
+        basis.append(residual)
+    return pd.DataFrame(
+        np.column_stack(basis),
+        index=exposures.index,
+        columns=factor_order,
+    )
+
+
+def _positive_weights(weights: pd.Series, index: pd.Index) -> np.ndarray:
+    aligned = weights.reindex(index)
+    values = aligned.to_numpy(dtype="float64")
+    if (
+        len(values) != len(index)
+        or not np.isfinite(values).all()
+        or not (values > 0).all()
+    ):
+        raise ValueError("regression weights must be finite and positive")
+    return values
+
+
+def _uniform_weights(weights: pd.Series, index: pd.Index) -> pd.Series:
+    values = _positive_weights(weights, index)
+    if len(values) and not np.allclose(values, values[0], rtol=0, atol=1e-12):
+        raise ValueError(
+            "SequentialOLSResidualizer only accepts uniform regression weights; "
+            "use SequentialWLSResidualizer or OLSResidualizer for weighted fits"
+        )
+    return pd.Series(1.0, index=index, name="regression_weight")
 
 
 def _sequential_projection(

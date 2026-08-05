@@ -34,10 +34,8 @@ class RecursiveMarketBetaModel:
 
     `prior_variance` is a weight in units of squared market return, so it is
     directly comparable to the `market_return ** 2` a single session contributes.
-    The default is about one session's worth against a steady state of
-    `market_return ** 2 / (1 - decay)`, which makes the bootstrap a tie-breaker
-    for the first few sessions rather than a lasting prior. Raise it to hold the
-    bootstrapped level for longer.
+    With a 1% market-return scale, the default is about one session's worth of
+    prior information. The decay controls how quickly that bootstrap fades.
     """
 
     base: SkipValidation[FactorModel]
@@ -184,23 +182,26 @@ class _PreparedRecursiveMarketBeta:
 
     def update(self, date: pd.Timestamp, fit: CrossSectionFit) -> None:
         self.base.update(date, fit)
-        factor_return = float(fit.factor_returns[self.name])
         market_return = float(self.market_returns.get(pd.Timestamp(date), np.nan))
         center = float(fit.exposure_centers[self.name])
-        if not np.isfinite(factor_return) or not np.isfinite(market_return):
+        intercept = float(fit.factor_returns.get("INTERCEPT", np.nan))
+        if not np.isfinite(intercept) or not np.isfinite(market_return):
             return
         if not np.isfinite(center):
             return
 
-        # Strip everything the cross-section attributed to other factors and to the
-        # intercept, leaving each name's market-attributable return, then restore the
-        # level the regression centered away using the *observed* market return. The
-        # result carries no dependence on the ticker's own beta, so regressing it on
-        # the market return cannot feed the estimator back into its own state.
-        non_market_fitted = (
-            fit.fitted_returns - fit.exposures[self.name] * factor_return
+        # Estimate the ordinary time-series market beta.  The old target removed
+        # every other fitted cross-sectional factor, but those factor returns can
+        # themselves absorb market co-movement when their estimated exposures are
+        # noisy.  That systemic feedback biased beta against correlated styles.
+        # Strip only the fitted intercept and restore the beta level centered out
+        # of the exposure.  The pipeline attaches all observed returns so names
+        # excluded by a long-window style (such as a new IPO missing HML) still
+        # receive a state update.
+        observed_returns = (
+            fit.observed_returns if fit.observed_returns is not None else fit.returns
         )
-        target_returns = fit.returns - non_market_fitted + center * market_return
+        target_returns = observed_returns - intercept + center * market_return
         shock = market_return**2
         for ticker, target_return in target_returns.items():
             if not np.isfinite(target_return):

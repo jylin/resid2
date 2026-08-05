@@ -1,6 +1,7 @@
 """Regressions for defects found by review, one test per fixed behavior."""
 
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,10 @@ from resid import (
 from resid.cli import MarketBetaConfig
 
 
+def timestamp(value: str) -> pd.Timestamp:
+    return cast(pd.Timestamp, pd.Timestamp(value))
+
+
 def write_marcap(directory: Path, frame: pd.DataFrame) -> MarcapDataSource:
     directory.mkdir(parents=True, exist_ok=True)
     for year, year_frame in frame.groupby(frame["Date"].dt.year):
@@ -30,29 +35,32 @@ def test_trading_dates_are_normalized_like_loaded_dates(tmp_path: Path) -> None:
     """Universe indexes are built from trading_dates then joined against load()."""
 
     sessions = pd.date_range("2025-01-02 09:00", periods=4, freq="B")
+    all_sessions = pd.DatetimeIndex([timestamp("2025-01-01 09:00"), *sessions])
     frame = pd.DataFrame(
         {
-            "Date": np.repeat(sessions, 2),
-            "Code": ["000001", "000002"] * len(sessions),
+            "Date": np.repeat(all_sessions, 2),
+            "Code": ["000001", "000002"] * len(all_sessions),
             "ChangesRatio": 1.0,
-            "Marcap": [2e9, 1e9] * len(sessions),
+            "Marcap": [2e9, 1e9] * len(all_sessions),
         }
     )
     source = write_marcap(tmp_path / "data", frame)
 
-    dates = source.trading_dates(pd.Timestamp("2025-01-01"), pd.Timestamp("2025-01-31"))
-    loaded = source.load(pd.Timestamp("2025-01-01"), pd.Timestamp("2025-01-31"))
+    dates = source.trading_dates(timestamp("2025-01-01"), timestamp("2025-01-31"))
+    loaded = source.load(timestamp("2025-01-01"), timestamp("2025-01-31"))
 
-    assert (dates == dates.normalize()).all()
+    assert all(value == cast(pd.Timestamp, value).normalize() for value in dates)
     assert set(dates) == set(loaded.index.get_level_values("date").unique())
     # A normalized end date must still find that day's intraday observations.
-    assert source.latest_date("2025-01-02") == pd.Timestamp("2025-01-02")
+    assert source.latest_date("2025-01-02") == timestamp("2025-01-02")
     assert source.latest_date() == sessions[-1].normalize()
     universe = FixedTopMarketCapUniverse(size=1).build(
-        source, AnalysisWindow(dates[0], dates[-1])
+        source, AnalysisWindow(sessions[0].normalize(), sessions[-1].normalize())
     )
     # Would raise KeyError if the two date representations disagreed.
-    assert universe.xs(dates[0], level="date").index.tolist() == ["000001"]
+    assert universe.xs(sessions[0].normalize(), level="date").index.tolist() == [
+        "000001"
+    ]
 
 
 def test_fixed_universe_rejects_an_empty_window(tmp_path: Path) -> None:
@@ -69,7 +77,7 @@ def test_fixed_universe_rejects_an_empty_window(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="no trading dates"):
         FixedTopMarketCapUniverse(size=1).build(
             source,
-            AnalysisWindow(pd.Timestamp("2030-01-01"), pd.Timestamp("2030-12-31")),
+            AnalysisWindow(timestamp("2030-01-01"), timestamp("2030-12-31")),
         )
 
 
@@ -92,7 +100,10 @@ def test_degenerate_exempt_column_is_not_fitted() -> None:
     tickers = pd.Index([f"T{i}" for i in range(20)], name="ticker")
     returns = pd.Series(np.linspace(-0.02, 0.02, len(tickers)), index=tickers)
     exposures = pd.DataFrame(
-        {"BETA": np.ones(len(tickers)), "SIZE": np.linspace(1, 20, len(tickers))},
+        {
+            "BETA": np.ones(len(tickers)),
+            "SIZE": np.square(np.linspace(1, 20, len(tickers))),
+        },
         index=tickers,
     )
     residualizer = SequentialWLSResidualizer(
@@ -113,7 +124,7 @@ def test_history_start_covers_the_requested_sessions() -> None:
     business_days = pd.date_range("2015-01-01", "2025-12-31", freq="B")
     holidays = business_days[:: 261 // 15]
     sessions = business_days.difference(holidays)
-    start = pd.Timestamp("2025-01-02")
+    start = timestamp("2025-01-02")
 
     for requested in (252, 1008, 1260):
         available = sessions[

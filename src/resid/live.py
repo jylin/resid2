@@ -1,7 +1,7 @@
 """Replayable live-period orchestration over the shared factor and OLS core."""
 
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal, cast
 
 import numpy as np
@@ -166,7 +166,10 @@ class LiveRegressionRunner:
             raise ValueError("period does not contain enough valid observations to fit")
         active.revision += 1
         date = cast(pd.Timestamp, pd.Timestamp(event.key.as_of))
-        self.factors.update(date, fit)
+        self.factors.update(
+            date,
+            replace(fit, observed_returns=active.regression.returns),
+        )
         result = LivePeriodResult(
             input_offset=offset,
             model_version=self.model_version,

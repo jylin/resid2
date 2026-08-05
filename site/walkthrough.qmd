@@ -19,8 +19,9 @@ universe selected from the previous close, and four factors:
 
 Sequential WLS removes them in that order after 1% exposure winsorization,
 weighting each name by the square root of its lagged market cap. Style
-exposures are weighted and standardized before the fits; MKT remains a beta
-exposure.
+exposures are weighted and standardized before an orthogonalization step;
+MKT remains a beta exposure. The resulting ordered basis is jointly
+orthogonal, so the final residual is orthogonal to the complete factor span.
 
 ## Factor definitions
 
@@ -41,25 +42,31 @@ window of `L`). HML negates this older return, making it a long-term reversal
 exposure.
 
 Before each cross-sectional fit, exposures are winsorized and centered. SIZE,
-HML, and MOM are then standardized; MKT stays in beta units.
+HML, and MOM are then standardized; MKT stays in beta units. Sequential output
+columns are the weighted orthogonal basis, not the correlated raw columns.
 
 For the regression below, $w_{i,t}$ is the positive weight for stock $i$ on
 date $t$. The main run uses the square root of lagged market cap. $x_{j,i,t}$ is
-the normalized exposure, $f_{j,t}$
-is the return attributed to factor $j$, and $e^{(j)}_{i,t}$ is the residual
-after removing the first $j$ factors. With $j$ running in the configured order,
-the sequential regression applies
+the normalized exposure, $q_{j,i,t}$ is its weighted orthogonalized version,
+$f_{j,t}$ is the return attributed to factor $j$, and $e^{(j)}_{i,t}$ is the
+residual after removing the first $j$ factors. With $j$ running in the configured
+order, the regression applies
 $$
-e^{(0)}_{i,t}=r_{i,t}-\frac{\sum_i w_{i,t}r_{i,t}}{\sum_i w_{i,t}},\qquad
-f_{j,t}=\frac{\sum_i w_{i,t}x_{j,i,t}e^{(j-1)}_{i,t}}
-{\sum_i w_{i,t}x_{j,i,t}^{2}},\qquad
-e^{(j)}_{i,t}=e^{(j-1)}_{i,t}-x_{j,i,t}f_{j,t}.
+q_{j}=x_{j}-\sum_{k<j}
+\frac{\langle x_j,q_k\rangle_w}{\langle q_k,q_k\rangle_w}q_k,
+\qquad
+e^{(0)}_{i,t}=r_{i,t}-\frac{\sum_i w_{i,t}r_{i,t}}{\sum_i w_{i,t}},
+$$
+$$
+f_{j,t}=\frac{\langle q_j,e^{(j-1)}\rangle_w}
+{\langle q_j,q_j\rangle_w},\qquad
+e^{(j)}_{i,t}=e^{(j-1)}_{i,t}-q_{j,i,t}f_{j,t}.
 $$
 
 The factors are removed in the order MKT, SIZE, HML, MOM, so each one explains
-what remains after the earlier factors. The final residual is orthogonal to MOM
-by construction, but it can still have exposure to MKT, SIZE, or HML because
-later regressions can reintroduce moments against earlier exposures.
+what remains after the earlier factors, while the orthogonalized basis makes the
+final residual orthogonal to all four factors. Changing that order changes the
+basis and the attribution, even though the fitted factor span is the same.
 
 ### Recursive market beta
 
@@ -76,9 +83,11 @@ N_{i,t}=\lambda N_{i,t-1}+g_t y_{i,t},\qquad
 \beta_{i,t+1}=\operatorname{clip}(N_{i,t}/D_{i,t}).
 $$
 
-Here $y_{i,t}=r_{i,t}-(\hat r_{i,t}-x_{i,t}f_{\mathrm{MKT},t})+c_tg_t$:
-the return after removing the intercept and style fits, with the centered beta
-level restored.
+Here $y_{i,t}=r_{i,t}-a_t+c_tg_t$, where $a_t$ is the fitted intercept and
+$c_t$ is the beta center. Only the intercept is stripped. This avoids feeding
+estimated, beta-correlated style returns back into the beta state, and the
+update applies to every name with a finite return and observed market shock,
+even when a long-window style excluded that name from the cross-section.
 
 The loop is stateful across dates, but it uses the same cross-sectional fit as
 the batch pipeline. The flow is:
@@ -144,6 +153,7 @@ validations = (
     resid.RegressionCoverageValidation(minimum_date_coverage=0.99),
     resid.FiniteOutputValidation(),
     resid.ReturnReconstructionValidation(absolute_tolerance=1e-12),
+    resid.ResidualOrthogonalityValidation(absolute_tolerance=1e-12),
     resid.SequentialOrthogonalityValidation(absolute_tolerance=1e-12),
 )
 
@@ -332,9 +342,8 @@ alternative.
 ## Ordered factor removal
 
 For each date, the intercept first removes the mean return. Exposures are
-winsorized, then centered, and every exposure except MKT is also scaled to unit
-variance. The model regresses the current residual on each exposure in order and
-passes the new residual to the next factor:
+winsorized, centered, scaled where configured, and orthogonalized in the
+explicit factor order before the residual loop:
 
 ```{mermaid}
 flowchart LR
@@ -347,7 +356,8 @@ flowchart LR
 ```
 
 MKT gets first claim on shared variation, followed by SIZE, HML, and MOM.
-Changing that order changes both factor attribution and residual returns.
+Changing that order changes the basis and factor attribution, while the fitted
+span and final residual remain the same when the columns are full rank.
 
 ```{python}
 ordered_x = result.exposures.set_index(["date", "ticker"])
@@ -386,8 +396,8 @@ stage_summary
 ```
 
 Each stage moment is measured immediately after removal and should be near
-zero. A later correlated factor can reintroduce an earlier moment, so the same
-calculation against final ε is a diagnostic rather than a validation rule:
+zero. Because the basis is orthogonalized, the same calculation against final ε
+should also be near zero for every factor:
 
 ```{python}
 final_moments = (
@@ -575,9 +585,9 @@ universe_builder = resid.DailyTopMarketCapUniverse(size=500)
 ```
 
 `end=None` selects the latest local observation. `DailyTopMarketCapUniverse`
-reselects from the previous close; `FixedTopMarketCapUniverse` holds the
-first-date snapshot. Another point-in-time rule only needs to implement
-`UniverseBuilder.build`.
+reselects from the previous close; `FixedTopMarketCapUniverse` selects from the
+close immediately before the first output date and holds that membership.
+Another point-in-time rule only needs to implement `UniverseBuilder.build`.
 
 ### Factors and ordering
 
@@ -627,9 +637,10 @@ residualizer = resid.SequentialWLSResidualizer(
 
 The evaluated configuration pairs `SquareRootMarketCapWeights` with
 `SequentialWLSResidualizer`. `EqualRegressionWeights` with
-`SequentialOLSResidualizer` is the equal-influence alternative, and
-`OLSResidualizer` remains the joint multivariate option. Weight construction and
-residualization are separate replaceable boundaries.
+`SequentialOLSResidualizer` is the equal-influence alternative. For a standard
+multivariate fit, use `OLSResidualizer` with either equal or square-root-cap
+weights. Weight construction and residualization are separate replaceable
+boundaries.
 
 ### Validation policy
 
@@ -638,6 +649,7 @@ validations = (
     resid.RegressionCoverageValidation(minimum_date_coverage=0.995),
     resid.FiniteOutputValidation(),
     resid.ReturnReconstructionValidation(absolute_tolerance=1e-12),
+    resid.ResidualOrthogonalityValidation(absolute_tolerance=1e-12),
     resid.SequentialOrthogonalityValidation(absolute_tolerance=1e-12),
 )
 ```
@@ -662,13 +674,13 @@ The mechanical checks pass:
 
 - all expected dates have full-rank fits and finite outputs;
 - stored returns reconstruct as $r = Xf + \varepsilon$; and
-- each factor is orthogonal to the residual immediately after its removal.
+- each factor is orthogonal to the residual immediately after its removal and
+  in the final residual.
 
 Those are regression identities, not proof of a complete risk model. Most
-single-name dispersion remains, later factors can reintroduce moments against
-earlier exposures, and the largest residuals still reflect events and data
-tails. The small mean lag-one autocorrelation is more encouraging: there is no
-obvious broad one-day pattern left in ε.
+single-name dispersion remains, and the largest residuals still reflect events
+and data tails. The small mean lag-one autocorrelation is more encouraging:
+there is no obvious broad one-day pattern left in ε.
 
 The corrected recursive beta starts from a pre-window bootstrap or the 1.0
 fallback, then uses the observed lagged-cap-weighted market return after each

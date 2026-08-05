@@ -131,7 +131,12 @@ def momentum_factor(
         raise ValueError("min_periods must be between 1 and lookback_days")
 
     def build(returns: pd.DataFrame, _: pd.DataFrame) -> pd.DataFrame:
-        safe_returns = returns.where(returns > -1.0)
+        # Missing observations represent non-trading days and may be skipped by
+        # the rolling minimum.  A return at or below -100%, however, is not a
+        # missing observation: allowing the rolling sum to skip it would make a
+        # collapsed name look as though the crash never happened.
+        valid_returns = returns.gt(-1.0) & np.isfinite(returns)
+        safe_returns = returns.where(valid_returns)
         log_returns = pd.DataFrame(
             np.log1p(safe_returns.to_numpy()),
             index=returns.index,
@@ -142,6 +147,14 @@ def momentum_factor(
             .rolling(lookback_days, min_periods=min_periods)
             .sum()
         )
+        crash_windows = (
+            returns.le(-1.0)
+            .astype("int8")
+            .shift(skip_days)
+            .rolling(lookback_days, min_periods=1)
+            .sum()
+        )
+        trailing = trailing.mask(crash_windows.gt(0))
         return pd.DataFrame(
             np.expm1(trailing.to_numpy()),
             index=trailing.index,

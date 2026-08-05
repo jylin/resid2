@@ -183,9 +183,10 @@ scheme replaces the other without changing the universe, factors, or estimator.
 
 `Residualizer.fit` receives one day's returns, raw exposures, and regression
 weights, and returns a `CrossSectionFit`, or `None` if the cross-section can't be
-estimated. The configured `SequentialWLSResidualizer` winsorizes every
-exposure once, centers and scales it, removes the intercept, then fits each named
-exposure against the residual left by the preceding step. `factor_order` must
+estimated. The configured `SequentialWLSResidualizer` winsorizes every exposure
+once, centers and scales it, applies an orthogonal basis in `factor_order`,
+removes the intercept, then fits each basis column against the residual left by
+the preceding step. `factor_order` must
 match the exposure names exactly, so the attribution order is always explicit.
 
 `unscaled_factors` names exposures that are still winsorized and centered but are
@@ -194,22 +195,22 @@ Centering is not optional. It keeps each exposure orthogonal to the intercept; a
 uncentered column would leave the market level and that factor fighting over the
 same variation. Every `CrossSectionFit` reports the `exposure_centers` and
 `exposure_scales` it applied, so a stateful factor can invert the map instead of
-guessing at it.
+guessing at it. The stored `X` columns are the exact orthogonalized design used
+for reconstruction.
 
 Alternatives behind the same protocol:
 
 - `SequentialOLSResidualizer` with `EqualRegressionWeights` for an
   equal-influence ordered fit.
-- `OLSResidualizer` for a joint multivariate fit.
+- `OLSResidualizer` for a weighted or equal-weight joint multivariate fit.
 - Any robust or vendor-supplied estimator, without changing the other stages.
 
 ### Validation and output
 
 Validations consume the completed result and return named metrics. The
 configured run checks date coverage, finite values, `r = Xf + ε`, and
-orthogonality immediately after each ordered factor is removed. It makes no claim
-that final ε is jointly orthogonal to every earlier raw exposure. Failed checks
-raise `RegressionValidationError`.
+orthogonality both after each ordered factor is removed and in the final
+residual. Failed checks raise `RegressionValidationError`.
 
 `CsvArtifactWriter` writes ε, r, X, and f atomically. Other formats can write
 the result DataFrames directly.
@@ -221,7 +222,7 @@ Three ways to pick a universe, and why only one is used:
 - **End-of-sample selection applied backward** carries survivor and look-ahead
   bias, because future winners, surviving listings, and later IPOs influence
   earlier research.
-- **A first-date snapshot held forward** does not look ahead, but goes stale as
+- **A pre-first-date snapshot held forward** avoids same-day look-ahead, but goes stale as
   names list, delist, grow, and shrink. Over one year only a modest fraction of
   large-cap membership turns over, so the staleness is bounded and the bias is
   small. Over ten years it compounds: the snapshot progressively describes a
@@ -262,8 +263,9 @@ figures are not repeated here.
 - **Regression:** sequential WLS after 1% cross-sectional exposure
   winsorization and centering, in the explicit order MKT, SIZE, HML, then MOM.
   SIZE, HML, and MOM are also scaled to unit variance. MKT is not, because beta
-  already has a meaningful unit. The configured weight is the square root of
-  lagged market cap.
+  already has a meaningful unit. The normalized columns are then weighted
+  orthogonalized in that order. The configured weight is the square
+  root of lagged market cap.
 
 `history_business_days` is loading padding, not a promise of an exact number
 of KRX observations. The factor builders enforce their own minimum periods.
@@ -284,29 +286,31 @@ Beta must be known before the return it explains:
 
 The regression transforms raw beta to
 $x_i = (\operatorname{winsor}(\beta_i) - c) / s$. Let $g_t$ be the observed
-lagged-cap-weighted market return and $f_t$ the fitted cross-sectional MKT
-slope. Before updating state, remove the fitted MKT component, restore the
-centered level with $g_t$, and update against $g_t$:
+lagged-cap-weighted market return and $a_t$ the fitted intercept. Before
+updating state, strip only the intercept, restore the centered level with
+$g_t$, and update against $g_t$:
 
 $$
-y_i = r_i - (\hat r_i - x_i f_t) + c g_t, \qquad
+y_i = r_i - a_t + c g_t, \qquad
 D_{i,t}=\lambda D_{i,t-1}+g_t^2, \qquad
 N_{i,t}=\lambda N_{i,t-1}+g_t y_i, \qquad
 \beta_{i,t+1}=\operatorname{clip}(N_{i,t}/D_{i,t}).
 $$
 
 This keeps the recursive state on the same scale as the bootstrap, prior, and
-$\pm5$ bounds. In the evaluated model MKT is unscaled, so $s=1$. The fitted
-cross-sectional slope remains a reported factor return but does not become the
-next period's market shock, avoiding feedback from the regression into its own
-exposures.
+$\pm5$ bounds. In the evaluated model MKT is unscaled, so $s=1$. Applying the
+target to every finite observed return also updates names excluded by a missing
+long-window factor. The fitted cross-sectional factor returns remain reported
+outputs but do not become the next period's market shock.
 
-The bootstrap and update use the same observed proxy. With
-`prior_variance=1e-4` and `decay=0.97`, the prior is worth roughly 25
-observations and halves about every 23 trading days.
+The bootstrap and update use the same observed proxy. A
+`prior_variance=1e-4` is about one session of prior information when daily
+market returns are near 1%; the configured `decay=0.97` halves its weight about
+every 23 trading days.
 
-Sequential removal gives earlier factors first claim on shared variation.
-Changing the order changes f, ε, and the model version.
+The ordered orthogonal basis gives earlier factors first claim on shared variation and
+makes the final residual orthogonal to the full factor span. Changing the order
+changes the basis, factor returns, ε, and the model version.
 
 ## Evidence that residualization worked
 
@@ -318,12 +322,12 @@ A mechanically correct sequential result should:
 - reconstruct raw returns,
 - be centered by the intercept,
 - be orthogonal to each factor at the moment that factor is removed,
+- have a final residual orthogonal to the complete modeled factor span,
 - have enough cross-sectional rank and coverage,
 - contain finite values.
 
-A later correlated factor can reintroduce a moment against an earlier exposure, so
-final-residual correlations are reported as diagnostics instead of counting as a
-failed fit.
+Final-residual moments are now checked directly because the ordered basis is
+orthogonalized before fitting.
 
 A *useful* residual-return series needs more: stable coverage and dispersion,
 plausible tails, little residual serial structure, and no known look-ahead. See
@@ -332,23 +336,22 @@ plausible tails, little residual serial structure, and no known look-ahead. See
 ## Authoritative and incremental regression
 
 `SequentialWLSResidualizer.fit` is the authoritative calculation in the
-configured run. It
-aligns returns, exposures, and positive weights, drops unusable rows, winsorizes,
-then centers every column and scales all but MKT using the same moments the
-regression uses. For normalized exposure $x_j$ and fixed weight $w_i$, it
-applies
+configured run. It aligns returns, exposures, and positive weights, drops
+unusable rows, winsorizes, centers, scales all but MKT, and then builds a
+weighted orthogonal basis in factor order. For basis exposure $q_j$ and fixed
+weight $w_i$, it applies
 
 $$
 e_i^{(0)} = r_i - \frac{\sum_i w_i r_i}{\sum_i w_i}, \qquad
-f_j = \frac{\sum_i w_i x_{ij}e_i^{(j-1)}}{\sum_i w_i x_{ij}^2}, \qquad
-e_i^{(j)} = e_i^{(j-1)} - x_{ij}f_j
+f_j = \frac{\sum_i w_i q_{ij}e_i^{(j-1)}}{\sum_i w_i q_{ij}^2}, \qquad
+e_i^{(j)} = e_i^{(j-1)} - q_{ij}f_j
 $$
 
 for $j =$ MKT, SIZE, HML, MOM. The final $e^{(4)}$ is ε, and the stored
-terms satisfy $r = Xf + \varepsilon$. R² and stage orthogonality use that same
-$w$. Residual dispersion stays a separate
-downstream diagnostic. `OLSResidualizer.fit` does the same job in one joint
-`numpy.linalg.lstsq` call, behind the same protocol.
+terms satisfy $r = Xf + \varepsilon$. R² and both stage and final orthogonality
+use that same $w$. Residual dispersion stays a separate downstream diagnostic.
+`OLSResidualizer.fit` performs the equivalent weighted or equal-weight joint
+projection in one square-root-weighted `numpy.linalg.lstsq` call.
 
 `IncrementalRegression` speeds up either canonical method. It is not a second
 model:
@@ -358,9 +361,8 @@ model:
   because the cross-section and normalization changed.
 - Once rows are stable, a cached linear coefficient map applies one return delta
   without repeating normalization or all regressions, then recalculates ε. For the
-  sequential model that map comes from the same ordered
-  residual-on-residual recurrence, so its cost scales with the small factor set
-  instead of a dense cross-section matrix.
+  sequential model that map uses the same orthogonalized basis, so its cost
+  scales with the small factor set instead of a dense cross-section matrix.
 
 At `PeriodClosed`, `IncrementalRegression.finalize` reruns the canonical fit from
 accumulated returns and raw exposures. Only that result is final, and only it can
@@ -495,10 +497,8 @@ and record the session and revision so research replay matches live processing.
   coverage but define a different model.
 - **Recursive beta is still path-dependent.** The state is updated only after a
   finalized fit, but the shock is the observed market proxy rather than the
-  fitted MKT slope. In the current report snapshot, the latest-date beta
-  quantiles are -0.56, -0.14, 0.07, 0.29, and 0.78 (1st through 99th
-  percentile); fewer than 0.02% of stored exposures reach either bound. A
-  slower decay or stronger shrinkage could still be useful for noisy names.
+  fitted MKT slope. The update strips only the intercept and applies to all
+  finite observed names, but a slower or faster decay remains a modeling choice.
 - **Event and data tails remain.** Marcap's return field handles its source's
   corporate-action adjustments, but the maximum absolute residual is above 100%.
   Downstream studies need their own event filters or robust treatment.

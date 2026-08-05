@@ -42,6 +42,7 @@ overrides.
 | r | `r.csv` | `(date, ticker, return)` |
 | X | `X.csv` | `(date, ticker, <one column per factor>)` |
 | f | `f.csv` | `(date, <one column per factor>)` |
-
 `epsilon.csv` is the primary output. The other files support reconstruction
-and diagnosis.
+`epsilon.csv` is the primary output. The other files support reconstruction
+and diagnosis. Sequential fits expose a weighted orthogonal basis, so `X.csv`
+is the exact design used for reconstruction.

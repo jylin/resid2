@@ -301,3 +301,90 @@ def test_recursive_beta_update_uses_observed_market_return() -> None:
     actual = prepared.exposures(dates[-1], tickers).loc["A", "MKT"]
     assert actual == pytest.approx(expected)
     assert actual > 0
+
+
+def test_recursive_beta_update_ignores_fitted_style_feedback_and_updates_all_names() -> (
+    None
+):
+    dates = pd.date_range("2025-01-01", periods=3, freq="B")
+    tickers = pd.Index(["A", "B", "C"], name="ticker")
+    index = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
+    market_data = pd.DataFrame(
+        {
+            "return_percent": np.tile([1.0, 2.0, 3.0], len(dates)),
+            "market_cap": np.tile([1e8, 2e8, 3e8], len(dates)),
+        },
+        index=index,
+    )
+    universe = pd.Series(
+        True,
+        index=pd.MultiIndex.from_product(
+            [[dates[-1]], tickers], names=["date", "ticker"]
+        ),
+        name="in_universe",
+    )
+    model = RecursiveMarketBetaModel(
+        base=CharacteristicFactorModel(
+            (Factor("STYLE", lambda returns, _: returns * 0 + 1, 0),)
+        ),
+        lookback_days=2,
+        min_periods=2,
+        decay=0.97,
+        name="MKT",
+    )
+    returns = PercentageReturns().calculate(market_data)
+    prepared = model.prepare(market_data, returns, universe)
+    before = prepared.exposures(dates[-1], tickers)["MKT"].copy()
+
+    fit_returns = pd.Series([0.01, 0.02], index=pd.Index(["A", "B"], name="ticker"))
+    exposures = pd.DataFrame(
+        {"MKT": [0.2, 0.4]}, index=pd.Index(["A", "B"], name="ticker")
+    )
+    fit = CrossSectionFit(
+        returns=fit_returns,
+        exposures=exposures,
+        regression_weights=pd.Series(1.0, index=fit_returns.index),
+        factor_returns=pd.Series({"INTERCEPT": 0.0, "MKT": -0.5}, name="factor_return"),
+        fitted_returns=exposures["MKT"] * -0.5,
+        specific_returns=fit_returns - exposures["MKT"] * -0.5,
+        rank=2,
+        r_squared=0.0,
+        exposure_centers=pd.Series({"MKT": 1.0}),
+        exposure_scales=pd.Series({"MKT": 1.0}),
+        observed_returns=pd.Series([0.01, 0.02, 0.03], index=tickers, name="return"),
+    )
+
+    prepared.update(dates[-1], fit)
+    after = prepared.exposures(dates[-1], tickers)["MKT"]
+
+    assert after["C"] != before["C"]
+
+    alternate_model = RecursiveMarketBetaModel(
+        base=CharacteristicFactorModel(
+            (Factor("STYLE", lambda returns, _: returns * 0 + 1, 0),)
+        ),
+        lookback_days=2,
+        min_periods=2,
+        decay=0.97,
+        name="MKT",
+    )
+    alternate = alternate_model.prepare(market_data, returns, universe)
+    alternate_fit = fit.__class__(
+        returns=fit.returns,
+        exposures=fit.exposures,
+        regression_weights=fit.regression_weights,
+        factor_returns=pd.Series({"INTERCEPT": 0.0, "MKT": 4.0}, name="factor_return"),
+        fitted_returns=fit.exposures["MKT"] * 4.0,
+        specific_returns=fit.returns - fit.exposures["MKT"] * 4.0,
+        rank=fit.rank,
+        r_squared=fit.r_squared,
+        exposure_centers=fit.exposure_centers,
+        exposure_scales=fit.exposure_scales,
+        observed_returns=fit.observed_returns,
+    )
+    alternate.update(dates[-1], alternate_fit)
+    np.testing.assert_allclose(
+        after,
+        alternate.exposures(dates[-1], tickers)["MKT"],
+        atol=1e-12,
+    )

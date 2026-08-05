@@ -64,10 +64,10 @@ The CSV files use standard factor-model notation:
 | r | `r.csv` | Returns used by the regression | `(date, ticker, return)` |
 | X | `X.csv` | Normalized exposures | `(date, ticker, <one column per factor>)` |
 | f | `f.csv` | Daily factor returns | `(date, <one column per factor>)` |
-
 `epsilon.csv` is the primary output. The other files support reconstruction
 and diagnosis. X and f store `INTERCEPT`, `MKT`, `SIZE`, `HML`, and `MOM` in
-removal order, with `r = Xf + ε`.
+removal order, with `r = Xf + ε`; sequential X columns use a weighted
+orthogonal basis.
 
 ## Python API
 
@@ -118,6 +118,7 @@ result = resid.run_pipeline(
         resid.RegressionCoverageValidation(minimum_date_coverage=0.99),
         resid.FiniteOutputValidation(),
         resid.ReturnReconstructionValidation(absolute_tolerance=1e-12),
+        resid.ResidualOrthogonalityValidation(absolute_tolerance=1e-12),
         resid.SequentialOrthogonalityValidation(absolute_tolerance=1e-12),
     ),
 )

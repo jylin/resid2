@@ -64,7 +64,16 @@ class MarcapDataSource:
             columns=["Date"], filter=_within_days(start, end)
         )["Date"]
         # Normalize to match load(), whose index these dates are joined against.
-        return pd.DatetimeIndex(dates.to_pandas().unique()).normalize().sort_values()
+        return (
+            pd.DatetimeIndex(
+                [
+                    cast(pd.Timestamp, pd.Timestamp(value)).normalize()
+                    for value in dates.to_pylist()
+                ]
+            )
+            .unique()
+            .sort_values()
+        )
 
     def load(
         self,
@@ -113,7 +122,7 @@ class UniverseBuilder(Protocol):
 
 @pydantic_dataclass(frozen=True, slots=True)
 class FixedTopMarketCapUniverse:
-    """Select one first-day universe and hold it through the window."""
+    """Select one pre-window universe and hold it through the window."""
 
     size: int = Field(gt=0)
 
@@ -121,10 +130,28 @@ class FixedTopMarketCapUniverse:
         dates = source.trading_dates(window.start, window.end)
         if not len(dates):
             raise ValueError("analysis window contains no trading dates")
-        snapshot = source.load(dates[0], dates[0])
+        try:
+            snapshot_date = source.latest_date(
+                (dates[0] - pd.Timedelta(days=1)).date().isoformat()
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "fixed universe requires a market-cap snapshot before the first "
+                "analysis date"
+            ) from exc
+        snapshot = source.load(snapshot_date, snapshot_date).reset_index()
         tickers = (
-            snapshot["market_cap"].nlargest(self.size).index.get_level_values("ticker")
+            snapshot.loc[snapshot["market_cap"].gt(0)]
+            .sort_values(
+                ["market_cap", "ticker"],
+                ascending=[False, True],
+            )
+            .head(self.size)["ticker"]
+            .astype("string")
+            .to_numpy()
         )
+        if not len(tickers):
+            raise ValueError("fixed universe snapshot contains no positive market caps")
         index = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
         return pd.Series(True, index=index, name="in_universe")
 
@@ -221,10 +248,11 @@ def history_start(start: pd.Timestamp, business_days: int) -> pd.Timestamp:
 
     if business_days <= 0:
         return start
-    return (
+    return cast(
+        pd.Timestamp,
         start
         - pd.offsets.BDay(business_days)
-        - pd.Timedelta(days=int(business_days * 0.1) + 7)
+        - pd.Timedelta(days=int(business_days * 0.1) + 7),
     )
 
 

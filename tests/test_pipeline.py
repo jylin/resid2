@@ -79,8 +79,9 @@ def canonical_frame(
 
 
 def test_fixed_universe_uses_only_first_output_date() -> None:
-    dates = pd.date_range("2025-01-02", periods=2, freq="B")
-    frame = canonical_frame(dates, ["A", "B", "C", "D"])
+    all_dates = pd.date_range("2025-01-01", periods=3, freq="B")
+    dates = all_dates[1:]
+    frame = canonical_frame(all_dates, ["A", "B", "C", "D"])
     frame.loc[(dates[1], "A"), "market_cap"] = 1_000
     source = FrameSource(frame)
 
@@ -198,6 +199,65 @@ def test_ols_recovers_cross_sectional_returns() -> None:
     assert fit.rank == 3
 
 
+def test_ols_uses_positive_regression_weights() -> None:
+    tickers = pd.Index(["A", "B", "C", "D"], name="ticker")
+    exposures = pd.DataFrame(
+        {"SIZE": [-1.5, -0.5, 0.5, 1.5]},
+        index=tickers,
+    )
+    returns = pd.Series([0.01, 0.015, 0.02, 0.08], index=tickers, name="return")
+    weights = pd.Series([1.0, 1.0, 1.0, 20.0], index=tickers)
+
+    fit = OLSResidualizer(winsor_quantile=0).fit(returns, exposures, weights)
+
+    assert fit is not None
+    design = np.column_stack([np.ones(len(fit.returns)), fit.exposures])
+    sqrt_weights = np.sqrt(fit.regression_weights.to_numpy())
+    expected, _, rank, _ = np.linalg.lstsq(
+        design * sqrt_weights[:, None],
+        fit.returns.to_numpy() * sqrt_weights,
+        rcond=None,
+    )
+    np.testing.assert_allclose(fit.factor_returns.to_numpy(), expected)
+    assert fit.rank == rank
+
+
+def test_equal_weight_sequential_residualizer_rejects_nonuniform_weights() -> None:
+    tickers = pd.Index(["A", "B", "C", "D"], name="ticker")
+    returns = pd.Series(np.linspace(0.01, 0.04, len(tickers)), index=tickers)
+    exposures = pd.DataFrame({"SIZE": np.arange(4.0)}, index=tickers)
+
+    with pytest.raises(ValueError, match="only accepts uniform"):
+        SequentialOLSResidualizer(factor_order=("SIZE",), winsor_quantile=0).fit(
+            returns,
+            exposures,
+            pd.Series([1.0, 1.0, 2.0, 2.0], index=tickers),
+        )
+
+
+def test_momentum_propagates_crash_days_but_skips_missing_observations() -> None:
+    dates = pd.date_range("2025-01-01", periods=8, freq="B")
+    returns = pd.DataFrame(
+        {
+            "CRASH": [0.01, 0.01, -1.0, 0.01, 0.01, 0.01, 0.01, 0.01],
+            "MISSING": [0.01, 0.01, np.nan, 0.01, 0.01, 0.01, 0.01, 0.01],
+        },
+        index=dates,
+    )
+    factor = momentum_factor(
+        lookback_days=3,
+        skip_days=1,
+        min_periods=2,
+        name="MOM",
+    )
+
+    values = factor.build(returns, pd.DataFrame(index=dates))
+
+    assert np.isfinite(values.loc[dates[2], "CRASH"])
+    assert np.isnan(values.loc[dates[3], "CRASH"])
+    assert np.isfinite(values.loc[dates[3], "MISSING"])
+
+
 def test_regressions_drop_nonfinite_rows() -> None:
     index = pd.Index([f"A{i}" for i in range(5)], name="ticker")
     returns = pd.Series([0.01, np.inf, 0.02, 0.03, 0.04], index=index)
@@ -297,7 +357,11 @@ def test_sequential_ols_removes_factors_in_explicit_order() -> None:
         factor_order=tuple(reversed(order)), winsor_quantile=0
     ).fit(returns, exposures, equal_weights)
     assert reversed_fit is not None
-    assert not np.allclose(fit.specific_returns, reversed_fit.specific_returns)
+    # Orthogonalization makes both orderings the same joint projection; only
+    # the ordered basis and attribution columns change.
+    np.testing.assert_allclose(
+        fit.specific_returns, reversed_fit.specific_returns, atol=1e-15
+    )
     assert fit.rank == 4
 
 
@@ -339,7 +403,11 @@ def test_unscaled_factor_keeps_its_raw_dispersion() -> None:
     tickers = pd.Index([f"A{i}" for i in range(10)], name="ticker")
     beta = np.linspace(0.5, 1.7, len(tickers))
     exposures = pd.DataFrame(
-        {"BETA": beta, "SIZE": np.linspace(24.0, 30.0, len(tickers))},
+        {
+            "BETA": beta,
+            "SIZE": np.linspace(24.0, 30.0, len(tickers))
+            + np.sin(np.linspace(0, 2 * np.pi, len(tickers))),
+        },
         index=tickers,
     )
     returns = pd.Series(np.linspace(-0.02, 0.03, len(tickers)), index=tickers)
@@ -364,12 +432,17 @@ def test_unscaled_factor_keeps_its_raw_dispersion() -> None:
     assert weighted_std(fit.exposures["BETA"].to_numpy()) == pytest.approx(
         weighted_std(beta)
     )
-    assert weighted_std(fit.exposures["SIZE"].to_numpy()) == pytest.approx(1.0)
-    for name in order:
-        column = fit.exposures[name].to_numpy()
-        assert np.average(column, weights=weight_values) == pytest.approx(0, abs=1e-14)
-        restored = column * fit.exposure_scales[name] + fit.exposure_centers[name]
-        np.testing.assert_allclose(restored, exposures[name], atol=1e-12)
+    assert np.average(fit.exposures["SIZE"], weights=weight_values) == pytest.approx(
+        0, abs=1e-14
+    )
+    assert np.dot(
+        weight_values * fit.exposures["BETA"], fit.exposures["SIZE"]
+    ) == pytest.approx(0, abs=1e-12)
+    beta_restored = (
+        fit.exposures["BETA"] * fit.exposure_scales["BETA"]
+        + fit.exposure_centers["BETA"]
+    )
+    np.testing.assert_allclose(beta_restored, exposures["BETA"], atol=1e-12)
 
 
 def test_pydantic_checks_component_bounds() -> None:
@@ -469,8 +542,9 @@ def test_full_marcap_pipeline_exports_csv(tmp_path: Path) -> None:
 
 
 def test_pipeline_components_are_replaceable() -> None:
-    dates = pd.date_range("2025-01-02", periods=8, freq="B")
-    source = FrameSource(canonical_frame(dates, [f"A{i}" for i in range(6)]))
+    all_dates = pd.date_range("2025-01-01", periods=9, freq="B")
+    dates = all_dates[1:]
+    source = FrameSource(canonical_frame(all_dates, [f"A{i}" for i in range(6)]))
     factor_calls = 0
 
     def reversal(returns: pd.DataFrame, _: pd.DataFrame) -> pd.DataFrame:
@@ -513,8 +587,11 @@ def test_pipeline_components_are_replaceable() -> None:
 
 
 def test_pipeline_runs_caller_specified_validations() -> None:
-    dates = pd.date_range("2025-01-02", periods=8, freq="B")
-    source = FrameSource(canonical_frame(dates, [f"A{i}" for i in range(6)]))
+    all_dates = pd.date_range("2025-01-01", periods=9, freq="B")
+    dates = all_dates[1:]
+    source = FrameSource(canonical_frame(all_dates, [f"A{i}" for i in range(6)]))
+    for ticker in [f"A{i}" for i in range(1, 6)]:
+        source.frame.loc[(dates[-1], ticker), "return_percent"] = np.nan
 
     def reversal(returns: pd.DataFrame, _: pd.DataFrame) -> pd.DataFrame:
         return -returns.shift(1)

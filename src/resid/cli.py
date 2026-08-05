@@ -23,14 +23,12 @@ from resid.factors import (
 )
 from resid.market_beta import RecursiveMarketBetaModel
 from resid.pipeline import run_pipeline
-from resid.regression import (
-    SequentialOLSResidualizer,
-    SequentialWLSResidualizer,
-)
+from resid.regression import SequentialOLSResidualizer, SequentialWLSResidualizer
 from resid.returns import PercentageReturns
 from resid.validation import (
     FiniteOutputValidation,
     RegressionCoverageValidation,
+    ResidualOrthogonalityValidation,
     ReturnReconstructionValidation,
     SequentialOrthogonalityValidation,
 )
@@ -286,6 +284,9 @@ def main() -> None:
             ),
             FiniteOutputValidation(),
             ReturnReconstructionValidation(
+                absolute_tolerance=config.validation.tolerance
+            ),
+            ResidualOrthogonalityValidation(
                 absolute_tolerance=config.validation.tolerance
             ),
             SequentialOrthogonalityValidation(
