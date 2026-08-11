@@ -136,11 +136,19 @@ def _residualize(
         day_returns = returns.xs(date, level="date").reindex(tickers)
         day_exposures = factors.exposures(date, tickers)
         day_weights = regression_weights.xs(date, level="date").reindex(tickers)
-        fit = residualizer.fit(
-            day_returns,
-            day_exposures,
-            day_weights,
-        )
+        fit_numpy = getattr(residualizer, "fit_numpy", None)
+        if fit_numpy is None:
+            fit = residualizer.fit(day_returns, day_exposures, day_weights)
+        else:
+            # The sequential built-ins can filter and fit directly on arrays,
+            # avoiding a temporary concatenated DataFrame for every date. Keep
+            # the protocol fallback above for caller-supplied residualizers.
+            fit = fit_numpy(
+                returns=day_returns.to_numpy(dtype="float64"),
+                exposures=day_exposures,
+                regression_weights=day_weights.to_numpy(dtype="float64"),
+                index=day_returns.index,
+            )
         if fit is None:
             continue
         artifacts.add(date, fit)

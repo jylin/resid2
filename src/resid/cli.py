@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from resid.artifacts import CsvArtifactWriter
+from resid.artifacts import ParquetArtifactWriter
 from resid.data import (
     DailyTopMarketCapUniverse,
     FixedTopMarketCapUniverse,
@@ -294,7 +294,7 @@ def main() -> None:
             ),
         ),
     )
-    manifest = CsvArtifactWriter().write(result, config.output.directory)
+    manifest = ParquetArtifactWriter().write(result, config.output.directory)
     dates = result.factor_returns["date"]
     observations = result.diagnostics["n_observations"]
     print(

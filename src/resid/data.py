@@ -2,16 +2,19 @@
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import cache
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import pandas as pd
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from pydantic import Field
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 MARCAP_COLUMNS = ["Date", "Code", "ChangesRatio", "Marcap"]
+_ARROW_COMPUTE = cast(Any, pc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,36 +47,28 @@ class MarcapDataSource:
     data_dir: Path
 
     def latest_date(self, end: str | None = None) -> pd.Timestamp:
-        requested = _timestamp(end) if end else None
-        for path in reversed(self._paths()):
-            if requested is not None and _year(path) > requested.year:
-                continue
-            date_filter = ds.field("Date") < _next_day(requested) if requested else None
-            dates = ds.dataset(path, format="parquet").to_table(
-                columns=["Date"], filter=date_filter
-            )["Date"]
-            if len(dates):
-                return _timestamp(max(dates.to_pylist()))
-        raise ValueError("no marcap observations found on or before end_date")
+        return _cached_latest_date(self.data_dir, end)
 
     def trading_dates(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
         paths = self._paths_in_range(start, end)
         if not paths:
             return pd.DatetimeIndex([], dtype="datetime64[ns]", name="date")
-        dates = ds.dataset(paths, format="parquet").to_table(
-            columns=["Date"], filter=_within_days(start, end)
-        )["Date"]
-        # Normalize to match load(), whose index these dates are joined against.
-        return (
-            pd.DatetimeIndex(
-                [
-                    cast(pd.Timestamp, pd.Timestamp(value)).normalize()
-                    for value in dates.to_pylist()
-                ]
-            )
-            .unique()
-            .sort_values()
+        dates = (
+            ds.dataset(paths, format="parquet")
+            .to_table(columns=["Date"], filter=_within_days(start, end))["Date"]
+            .combine_chunks()
         )
+        if not len(dates):
+            return pd.DatetimeIndex([], dtype="datetime64[ns]", name="date")
+
+        # Normalize and deduplicate in Arrow. The old implementation converted
+        # every stock-level timestamp to a Python object before taking the unique
+        # trading-session set; a ten-year slice contains millions of repeated
+        # values but only a few thousand sessions.
+        normalized = _ARROW_COMPUTE.floor_temporal(dates, multiple=1, unit="day")
+        unique = _ARROW_COMPUTE.unique(normalized)
+        ordered = pc.take(unique, _ARROW_COMPUTE.sort_indices(unique))
+        return pd.DatetimeIndex(ordered.to_pandas()).rename("date")
 
     def load(
         self,
@@ -87,21 +82,29 @@ class MarcapDataSource:
         data_filter = _within_days(start, end)
         if tickers is not None:
             data_filter &= ds.field("Code").isin(tickers.astype(str).tolist())
-        frame = (
-            ds.dataset(paths, format="parquet")
-            .to_table(columns=MARCAP_COLUMNS, filter=data_filter)
-            .to_pandas()
-            .rename(
-                columns={
-                    "Date": "date",
-                    "Code": "ticker",
-                    "ChangesRatio": "return_percent",
-                    "Marcap": "market_cap",
-                }
+        table = ds.dataset(paths, format="parquet").to_table(
+            columns=MARCAP_COLUMNS, filter=data_filter
+        )
+        code_lengths = _ARROW_COMPUTE.utf8_length(table["Code"])
+        needs_padding = bool(
+            len(code_lengths)
+            and (
+                _ARROW_COMPUTE.min(code_lengths).as_py() != 6
+                or _ARROW_COMPUTE.max(code_lengths).as_py() != 6
             )
         )
+        frame = table.to_pandas().rename(
+            columns={
+                "Date": "date",
+                "Code": "ticker",
+                "ChangesRatio": "return_percent",
+                "Marcap": "market_cap",
+            }
+        )
         frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
-        frame["ticker"] = frame["ticker"].astype("string").str.zfill(6)
+        frame["ticker"] = frame["ticker"].astype("string")
+        if needs_padding:
+            frame["ticker"] = frame["ticker"].str.zfill(6)
         return frame.set_index(["date", "ticker"]).sort_index()
 
     def _paths_in_range(self, start: pd.Timestamp, end: pd.Timestamp) -> list[Path]:
@@ -287,6 +290,24 @@ def _empty_market_data() -> pd.DataFrame:
             "market_cap": pd.Series(dtype="float64"),
         }
     ).set_index(["date", "ticker"])
+
+
+@cache
+def _cached_latest_date(data_dir: Path, end: str | None = None) -> pd.Timestamp:
+    requested = _timestamp(end) if end else None
+    paths = sorted(data_dir.expanduser().resolve().glob("marcap-*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"no marcap-*.parquet files found in {data_dir}")
+    for path in reversed(paths):
+        if requested is not None and _year(path) > requested.year:
+            continue
+        date_filter = ds.field("Date") < _next_day(requested) if requested else None
+        dates = ds.dataset(path, format="parquet").to_table(
+            columns=["Date"], filter=date_filter
+        )["Date"]
+        if len(dates):
+            return _timestamp(_ARROW_COMPUTE.max(dates).as_py())
+    raise ValueError("no marcap observations found on or before end_date")
 
 
 def _timestamp(

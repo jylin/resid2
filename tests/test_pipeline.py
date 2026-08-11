@@ -11,7 +11,6 @@ from resid import (
     AnalysisWindow,
     CharacteristicFactorModel,
     CrossSectionFit,
-    CsvArtifactWriter,
     DailyTopMarketCapUniverse,
     EqualRegressionWeights,
     Factor,
@@ -19,6 +18,7 @@ from resid import (
     FixedTopMarketCapUniverse,
     MarcapDataSource,
     OLSResidualizer,
+    ParquetArtifactWriter,
     PercentageReturns,
     RegressionCoverageValidation,
     RegressionValidationError,
@@ -473,7 +473,7 @@ def test_factor_model_rejects_empty_or_duplicate_factors() -> None:
         CharacteristicFactorModel((size_factor(name="SIZE"), size_factor(name="SIZE")))
 
 
-def test_full_marcap_pipeline_exports_csv(tmp_path: Path) -> None:
+def test_full_marcap_pipeline_exports_parquet(tmp_path: Path) -> None:
     data_dir = tmp_path / "marcap" / "data"
     data_dir.mkdir(parents=True)
     dates = pd.date_range("2024-01-02", "2025-06-30", freq="B")
@@ -520,7 +520,7 @@ def test_full_marcap_pipeline_exports_csv(tmp_path: Path) -> None:
         regression_weight_model=EqualRegressionWeights(),
     )
     output_dir = tmp_path / "output"
-    manifest = CsvArtifactWriter().write(result, output_dir)
+    manifest = ParquetArtifactWriter().write(result, output_dir)
 
     first_members = result.universe.xs(pd.Timestamp("2024-07-01")).index
     assert tuple(first_members) == tuple(reversed(tickers[1:]))
@@ -534,10 +534,10 @@ def test_full_marcap_pipeline_exports_csv(tmp_path: Path) -> None:
     ]
     assert manifest["artifact"].tolist() == ["epsilon", "r", "X", "f"]
     assert {path.name for path in output_dir.iterdir()} == {
-        "epsilon.csv",
-        "r.csv",
-        "X.csv",
-        "f.csv",
+        "epsilon.parquet",
+        "r.parquet",
+        "X.parquet",
+        "f.parquet",
     }
 
 

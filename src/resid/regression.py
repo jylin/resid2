@@ -183,6 +183,23 @@ class SequentialOLSResidualizer:
             unscaled_factors=self.unscaled_factors,
         )
 
+    def fit_numpy(
+        self,
+        returns: np.ndarray,
+        exposures: pd.DataFrame,
+        regression_weights: np.ndarray,
+        index: pd.Index,
+    ) -> CrossSectionFit | None:
+        return _fit_sequential_numpy(
+            returns=returns,
+            exposures=exposures,
+            regression_weights=regression_weights,
+            index=index,
+            factor_order=self.factor_order,
+            winsor_quantile=self.winsor_quantile,
+            unscaled_factors=self.unscaled_factors,
+        )
+
     def coefficient_projection(
         self,
         exposures: pd.DataFrame,
@@ -215,6 +232,23 @@ class SequentialWLSResidualizer:
             returns=returns,
             exposures=exposures,
             regression_weights=regression_weights,
+            factor_order=self.factor_order,
+            winsor_quantile=self.winsor_quantile,
+            unscaled_factors=self.unscaled_factors,
+        )
+
+    def fit_numpy(
+        self,
+        returns: np.ndarray,
+        exposures: pd.DataFrame,
+        regression_weights: np.ndarray,
+        index: pd.Index,
+    ) -> CrossSectionFit | None:
+        return _fit_sequential_numpy(
+            returns=returns,
+            exposures=exposures,
+            regression_weights=regression_weights,
+            index=index,
             factor_order=self.factor_order,
             winsor_quantile=self.winsor_quantile,
             unscaled_factors=self.unscaled_factors,
@@ -311,6 +345,140 @@ def _fit_sequential(
         model_columns=model_columns,
         rank=int(np.linalg.matrix_rank(design)),
     )
+
+
+def _fit_sequential_numpy(
+    *,
+    returns: np.ndarray,
+    exposures: pd.DataFrame,
+    regression_weights: np.ndarray,
+    index: pd.Index,
+    factor_order: tuple[str, ...],
+    winsor_quantile: float,
+    unscaled_factors: tuple[str, ...] = (),
+) -> CrossSectionFit | None:
+    """Fit the sequential model without assembling a per-day pandas frame."""
+
+    exposure_names = tuple(str(name) for name in exposures.columns)
+    if set(exposure_names) != set(factor_order) or len(exposure_names) != len(
+        factor_order
+    ):
+        raise ValueError(
+            "exposures must match factor_order exactly: "
+            f"expected {factor_order}, received {exposure_names}"
+        )
+
+    model_columns = ("INTERCEPT", *factor_order)
+    positions = exposures.columns.get_indexer(factor_order)
+    ordered_values = exposures.to_numpy(dtype="float64")[:, positions]
+    return_values = np.asarray(returns, dtype="float64")
+    weight_values = np.asarray(regression_weights, dtype="float64")
+    valid = (
+        np.isfinite(return_values)
+        & np.isfinite(weight_values)
+        & (weight_values > 0)
+        & np.isfinite(ordered_values).all(axis=1)
+    )
+    if int(valid.sum()) <= len(model_columns):
+        return None
+
+    target_values = return_values[valid]
+    weight_values = weight_values[valid]
+    exposure_values = ordered_values[valid].copy()
+    used_index = index[valid]
+
+    lower, upper = np.quantile(
+        exposure_values,
+        (winsor_quantile, 1 - winsor_quantile),
+        axis=0,
+    )
+    np.clip(exposure_values, lower, upper, out=exposure_values)
+    centers = np.average(exposure_values, weights=weight_values, axis=0)
+    dispersion = np.sqrt(
+        np.average(
+            np.square(exposure_values - centers),
+            weights=weight_values,
+            axis=0,
+        )
+    )
+    if np.any(~np.isfinite(dispersion) | (dispersion <= 0)):
+        return None
+
+    exempt = np.fromiter(
+        (name in unscaled_factors for name in factor_order),
+        dtype="bool",
+        count=len(factor_order),
+    )
+    scales = np.where(exempt, 1.0, dispersion)
+    exposure_values -= centers
+    exposure_values /= scales
+
+    orthogonalized = _orthogonalize_numpy(
+        exposure_values,
+        factor_order,
+        weight_values,
+    )
+    if orthogonalized is None:
+        return None
+
+    remaining = target_values.copy()
+    intercept = float(np.average(remaining, weights=weight_values))
+    remaining -= intercept
+    coefficients = [intercept]
+    for position in range(len(factor_order)):
+        exposure = orthogonalized[:, position]
+        weighted_exposure = weight_values * exposure
+        coefficient = float(
+            np.dot(weighted_exposure, remaining) / np.dot(weighted_exposure, exposure)
+        )
+        coefficients.append(coefficient)
+        remaining -= exposure * coefficient
+
+    normalized = _NormalizedExposures(
+        exposures=pd.DataFrame(
+            orthogonalized,
+            index=used_index,
+            columns=factor_order,
+        ),
+        centers=pd.Series(centers, index=factor_order, name="exposure_center"),
+        scales=pd.Series(scales, index=factor_order, name="exposure_scale"),
+    )
+    return _cross_section_fit(
+        target=pd.Series(target_values, index=used_index, name="return"),
+        normalized=normalized,
+        regression_weights=pd.Series(
+            weight_values,
+            index=used_index,
+            name="regression_weight",
+        ),
+        coefficients=np.asarray(coefficients),
+        model_columns=model_columns,
+        rank=int(np.linalg.matrix_rank(_design(normalized.exposures))),
+    )
+
+
+def _orthogonalize_numpy(
+    exposures: np.ndarray,
+    factor_order: tuple[str, ...],
+    weights: np.ndarray,
+) -> np.ndarray | None:
+    """Build the same weighted orthogonal basis as `_orthogonalize`."""
+
+    basis: list[np.ndarray] = []
+    for position, _ in enumerate(factor_order):
+        residual = exposures[:, position].copy()
+        original_denominator = float(np.dot(weights * residual, residual))
+        for prior in basis:
+            denominator = float(np.dot(weights * prior, prior))
+            if not np.isfinite(denominator) or denominator <= 0:
+                return None
+            residual -= (np.dot(weights * residual, prior) / denominator) * prior
+        denominator = float(np.dot(weights * residual, residual))
+        tolerance = np.finfo("float64").eps * max(1.0, original_denominator) * 100
+        if not np.isfinite(denominator) or denominator <= tolerance:
+            return None
+        basis.append(residual)
+    return np.column_stack(basis)
 
 
 @plain_dataclass(slots=True, eq=False)

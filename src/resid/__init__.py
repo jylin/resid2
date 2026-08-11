@@ -1,6 +1,6 @@
 """Composable cross-sectional return residualization."""
 
-from resid.artifacts import CsvArtifactWriter
+from resid.artifacts import ParquetArtifactWriter
 from resid.data import (
     AnalysisWindow,
     DailyTopMarketCapUniverse,

@@ -69,7 +69,7 @@ class RecursiveMarketBetaModel:
         base = self.base.prepare(market_data, returns, universe)
         if self.name in base.names:
             raise ValueError(f"duplicate factor name: {self.name}")
-        numerators, denominators = self._initial_state(market_data, returns, universe)
+        tickers, initial_betas = self._initial_state(market_data, returns, universe)
         market_returns = self._market_returns(market_data, returns, universe)
         return _PreparedRecursiveMarketBeta(
             base=base,
@@ -79,8 +79,9 @@ class RecursiveMarketBetaModel:
             prior_variance=self.prior_variance,
             lower_bound=self.lower_bound,
             upper_bound=self.upper_bound,
-            numerators=numerators,
-            denominators=denominators,
+            ticker_index=tickers,
+            numerators=initial_betas * self.prior_variance,
+            denominators=np.full(len(tickers), self.prior_variance, dtype="float64"),
             market_returns=market_returns,
         )
 
@@ -103,7 +104,7 @@ class RecursiveMarketBetaModel:
         market_data: pd.DataFrame,
         returns: pd.Series,
         universe: pd.Series,
-    ) -> tuple[dict[str, float], dict[str, float]]:
+    ) -> tuple[pd.Index, np.ndarray]:
         analysis_start = universe_dates(universe)[0]
         initial_tickers = universe_members(universe, analysis_start)
         initial_index = returns.index[
@@ -134,7 +135,8 @@ class RecursiveMarketBetaModel:
         ].dropna(subset=["market_return"])
 
         tickers = returns.index.get_level_values("ticker").unique()
-        initial_betas = {str(ticker): self.initial_beta for ticker in tickers}
+        positions = {str(ticker): position for position, ticker in enumerate(tickers)}
+        initial_betas = np.full(len(tickers), self.initial_beta, dtype="float64")
         for ticker, observations in history.groupby(level="ticker", sort=False):
             observations = observations.tail(self.lookback_days)
             if len(observations) < self.min_periods:
@@ -147,15 +149,13 @@ class RecursiveMarketBetaModel:
             if variance <= 0:
                 continue
             beta = float(np.dot(market, asset) / variance)
-            initial_betas[str(ticker)] = float(
-                np.clip(beta, self.lower_bound, self.upper_bound)
-            )
+            position = positions.get(str(ticker))
+            if position is not None:
+                initial_betas[position] = np.clip(
+                    beta, self.lower_bound, self.upper_bound
+                )
 
-        denominators = {ticker: self.prior_variance for ticker in initial_betas}
-        numerators = {
-            ticker: beta * self.prior_variance for ticker, beta in initial_betas.items()
-        }
-        return numerators, denominators
+        return tickers, initial_betas
 
 
 @plain_dataclass(slots=True, eq=False)
@@ -167,8 +167,9 @@ class _PreparedRecursiveMarketBeta:
     prior_variance: float
     lower_bound: float
     upper_bound: float
-    numerators: dict[str, float]
-    denominators: dict[str, float]
+    ticker_index: pd.Index
+    numerators: np.ndarray
+    denominators: np.ndarray
     market_returns: pd.Series
 
     @property
@@ -177,7 +178,13 @@ class _PreparedRecursiveMarketBeta:
 
     def exposures(self, date: pd.Timestamp, tickers: pd.Index) -> pd.DataFrame:
         exposures = self.base.exposures(date, tickers).copy()
-        exposures[self.name] = [self._beta(str(ticker)) for ticker in tickers]
+        positions = self.ticker_index.get_indexer(tickers)
+        betas = np.full(len(tickers), self.initial_beta, dtype="float64")
+        known = positions >= 0
+        betas[known] = (
+            self.numerators[positions[known]] / self.denominators[positions[known]]
+        )
+        exposures[self.name] = betas
         return exposures
 
     def update(self, date: pd.Timestamp, fit: CrossSectionFit) -> None:
@@ -203,33 +210,28 @@ class _PreparedRecursiveMarketBeta:
         )
         target_returns = observed_returns - intercept + center * market_return
         shock = market_return**2
-        for ticker, target_return in target_returns.items():
-            if not np.isfinite(target_return):
-                continue
-            key = str(ticker)
-            denominator = self.denominators.get(key, self.prior_variance)
-            numerator = self.numerators.get(
-                key, self.initial_beta * self.prior_variance
-            )
-            denominator = self.decay * denominator + shock
-            numerator = self.decay * numerator + market_return * float(target_return)
-            # Write the bounded beta back rather than clipping on read. Keeping the
-            # raw ratio in state lets it wander far outside the bounds and recover
-            # slowly, which pins twice as much of the exposure column to the rail.
-            beta = float(
-                np.clip(
-                    numerator / denominator,
-                    self.lower_bound,
-                    self.upper_bound,
-                )
-            )
-            self.denominators[key] = denominator
-            self.numerators[key] = beta * denominator
+        target_values = target_returns.to_numpy(dtype="float64", na_value=np.nan)
+        positions = self.ticker_index.get_indexer(target_returns.index)
+        valid = (positions >= 0) & np.isfinite(target_values)
+        if not valid.any():
+            return
 
-    def _beta(self, ticker: str) -> float:
-        denominator = self.denominators.get(ticker, self.prior_variance)
-        numerator = self.numerators.get(ticker, self.initial_beta * self.prior_variance)
-        return numerator / denominator
+        positions = positions[valid]
+        target_values = target_values[valid]
+        denominator = self.decay * self.denominators[positions] + shock
+        numerator = (
+            self.decay * self.numerators[positions] + market_return * target_values
+        )
+        # Write the bounded beta back rather than clipping on read. Keeping the
+        # raw ratio in state lets it wander far outside the bounds and recover
+        # slowly, which pins twice as much of the exposure column to the rail.
+        beta = np.clip(
+            numerator / denominator,
+            self.lower_bound,
+            self.upper_bound,
+        )
+        self.denominators[positions] = denominator
+        self.numerators[positions] = beta * denominator
 
 
 def _weighted_market_returns(

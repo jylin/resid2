@@ -32,17 +32,17 @@ uv run resid ../marcap/data --config resid.toml
 The positional data path is required. Other CLI values override matching TOML
 fields; for example, `--universe-size 500` or `--regression-method sqrt-cap-wls`.
 Copy `resid.toml` for another experiment. See `uv run resid --help` for all
-overrides.
+overrides. Artifacts are written as typed, compressed Parquet files.
 
 ### Outputs
 
 | Notation | File | Schema |
 |---|---|---|
-| ε | `epsilon.csv` | `(date, ticker, specific_return)` |
-| r | `r.csv` | `(date, ticker, return)` |
-| X | `X.csv` | `(date, ticker, <one column per factor>)` |
-| f | `f.csv` | `(date, <one column per factor>)` |
-`epsilon.csv` is the primary output. The other files support reconstruction
-`epsilon.csv` is the primary output. The other files support reconstruction
-and diagnosis. Sequential fits expose a weighted orthogonal basis, so `X.csv`
-is the exact design used for reconstruction.
+| ε | `epsilon.parquet` | `(date, ticker, specific_return)` |
+| r | `r.parquet` | `(date, ticker, return)` |
+| X | `X.parquet` | `(date, ticker, <one column per factor>)` |
+| f | `f.parquet` | `(date, <one column per factor>)` |
+
+`epsilon` is the primary output. The other files support reconstruction and
+diagnosis. Sequential fits expose a weighted orthogonal basis, so `X` is the
+exact design used for reconstruction.
