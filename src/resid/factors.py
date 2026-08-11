@@ -9,6 +9,7 @@ import pandas as pd
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 
+from resid.progress import StageProgress
 from resid.regression import CrossSectionFit
 
 FactorBuilder = Callable[[pd.DataFrame, pd.DataFrame], pd.DataFrame]
@@ -59,7 +60,19 @@ class CharacteristicFactorModel:
     def history_business_days(self) -> int:
         return max(factor.history_business_days for factor in self.factors)
 
+    @property
+    def progress_steps(self) -> int:
+        return len(self.factors)
+
     def exposures(self, market_data: pd.DataFrame, returns: pd.Series) -> pd.DataFrame:
+        return self._exposures(market_data, returns)
+
+    def _exposures(
+        self,
+        market_data: pd.DataFrame,
+        returns: pd.Series,
+        progress: StageProgress | None = None,
+    ) -> pd.DataFrame:
         wide_returns = returns.unstack("ticker")
         market_caps = (
             market_data["market_cap"].unstack("ticker").reindex_like(wide_returns)
@@ -70,12 +83,13 @@ class CharacteristicFactorModel:
         # Flattening assumes each builder's output is laid out exactly like
         # wide_returns, so align rather than trust it: a builder that reindexes
         # would otherwise scramble exposures across dates without any error.
-        matrices = {
-            factor.name: factor.build(wide_returns, market_caps).reindex(
+        matrices: dict[str, pd.DataFrame] = {}
+        for position, factor in enumerate(self.factors, start=1):
+            matrices[factor.name] = factor.build(wide_returns, market_caps).reindex(
                 index=wide_returns.index, columns=wide_returns.columns
             )
-            for factor in self.factors
-        }
+            if progress is not None:
+                progress.update(position, factor.name)
         return pd.DataFrame(
             {name: matrix.to_numpy().ravel() for name, matrix in matrices.items()},
             index=index,
@@ -89,6 +103,16 @@ class CharacteristicFactorModel:
     ) -> PreparedFactorModel:
         del universe
         return _StaticFactorModel(self.exposures(market_data, returns))
+
+    def prepare_with_progress(
+        self,
+        market_data: pd.DataFrame,
+        returns: pd.Series,
+        universe: pd.Series,
+        progress: StageProgress,
+    ) -> PreparedFactorModel:
+        del universe
+        return _StaticFactorModel(self._exposures(market_data, returns, progress))
 
 
 @plain_dataclass(frozen=True, slots=True, eq=False)

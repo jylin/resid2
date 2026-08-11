@@ -3,6 +3,7 @@
 import argparse
 import tomllib
 from pathlib import Path
+from time import perf_counter
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -23,6 +24,7 @@ from resid.factors import (
 )
 from resid.market_beta import RecursiveMarketBetaModel
 from resid.pipeline import run_pipeline
+from resid.progress import TerminalProgress, reported_stage
 from resid.regression import SequentialOLSResidualizer, SequentialWLSResidualizer
 from resid.returns import PercentageReturns
 from resid.validation import (
@@ -212,9 +214,20 @@ def apply_cli_overrides(config: CliConfig, args: argparse.Namespace) -> CliConfi
     return CliConfig.model_validate(values)
 
 
+def _format_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if amount < 1024 or unit == "GiB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} GiB"
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    run_started = perf_counter()
+    progress = TerminalProgress(total_stages=7)
     try:
         config = apply_cli_overrides(load_config(args.config), args)
     except (OSError, tomllib.TOMLDecodeError, ValidationError, ValueError) as exc:
@@ -293,24 +306,49 @@ def main() -> None:
                 absolute_tolerance=config.validation.tolerance
             ),
         ),
+        progress=progress,
     )
-    manifest = ParquetArtifactWriter().write(result, config.output.directory)
+    with reported_stage(
+        progress,
+        "Write Parquet artifacts",
+        total=4,
+        unit="files",
+    ) as stage:
+        manifest = ParquetArtifactWriter().write(
+            result,
+            config.output.directory,
+            progress=stage,
+        )
+    elapsed = perf_counter() - run_started
     dates = result.factor_returns["date"]
     observations = result.diagnostics["n_observations"]
+    fitted_rows = len(result.specific_returns)
+    output_bytes = sum(
+        Path(str(path)).stat().st_size for path in manifest["path"].tolist()
+    )
+    regression_rate = len(dates) / elapsed if elapsed > 0 else 0.0
+    row_rate = fitted_rows / elapsed if elapsed > 0 else 0.0
+    output_rate = output_bytes / elapsed / 1024**2 if elapsed > 0 else 0.0
+    print("run summary")
     print(
-        f"{len(dates)} regressions from {dates.min().date()} to "
-        f"{dates.max().date()} with {int(observations.min())}-"
-        f"{int(observations.max())} usable names/day "
-        f"({config.universe.size} target)"
+        f"  regressions: {len(dates):,} ({dates.min().date()} to {dates.max().date()})"
     )
     print(
-        "validations: "
-        + ", ".join(
-            f"{validation.name}={'pass' if validation.passed else 'fail'}"
-            for validation in result.validation_results
-        )
+        f"  usable names/day: {int(observations.min()):,}-"
+        f"{int(observations.max()):,} (target: {config.universe.size:,})"
     )
-    print(manifest.to_string(index=False))
+    print("  validations:")
+    for validation in result.validation_results:
+        status = "pass" if validation.passed else "fail"
+        print(f"    {validation.name}: {status}")
+    print("  artifacts:")
+    for artifact, rows, path in manifest.itertuples(index=False, name=None):
+        print(f"    {artifact}: {int(rows):,} rows -> {path}")
+    print("  timing:")
+    print(f"    total: {elapsed:.2f}s")
+    print(f"    regressions: {len(dates):,} ({regression_rate:.1f}/s)")
+    print(f"    fitted rows: {fitted_rows:,} ({row_rate:,.0f}/s)")
+    print(f"    output: {_format_bytes(output_bytes)} ({output_rate:.1f} MiB/s)")
 
 
 if __name__ == "__main__":

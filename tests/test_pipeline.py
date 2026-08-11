@@ -33,6 +33,7 @@ from resid import (
     run_pipeline,
     size_factor,
 )
+from resid.pipeline import _table_preview
 
 
 @dataclass
@@ -75,6 +76,29 @@ def canonical_frame(
             "market_cap": np.tile(np.arange(1, len(tickers) + 1), len(dates)),
         },
         index=index,
+    )
+
+
+def test_table_preview_reports_key_dimensions_for_indexed_and_flat_tables() -> None:
+    dates = pd.date_range("2025-01-01", periods=2, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, pd.Index(["A", "B", "C"], name="ticker")],
+        names=["date", "ticker"],
+    )
+    indexed = pd.DataFrame(
+        {"return_percent": 1.0, "market_cap": 2.0},
+        index=index,
+    )
+
+    assert _table_preview("market_data", indexed) == (
+        "market_data: 6 rows\n"
+        "  keys: 2 dates x 3 tickers\n"
+        "  values: return_percent, market_cap"
+    )
+    assert _table_preview("r", indexed.reset_index().assign(return_value=1.0)) == (
+        "r: 6 rows\n"
+        "  keys: 2 dates x 3 tickers\n"
+        "  values: return_percent, market_cap, return_value"
     )
 
 

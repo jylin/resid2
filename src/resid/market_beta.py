@@ -14,6 +14,7 @@ from resid.data import (
     universe_members,
 )
 from resid.factors import FactorModel, PreparedFactorModel
+from resid.progress import StageProgress
 from resid.regression import CrossSectionFit
 
 
@@ -60,17 +61,49 @@ class RecursiveMarketBetaModel:
     def history_business_days(self) -> int:
         return max(self.base.history_business_days, self.lookback_days)
 
+    @property
+    def progress_steps(self) -> int | None:
+        base_steps = getattr(self.base, "progress_steps", None)
+        return base_steps + 2 if isinstance(base_steps, int) else None
+
     def prepare(
         self,
         market_data: pd.DataFrame,
         returns: pd.Series,
         universe: pd.Series,
     ) -> PreparedFactorModel:
-        base = self.base.prepare(market_data, returns, universe)
+        return self._prepare(market_data, returns, universe)
+
+    def prepare_with_progress(
+        self,
+        market_data: pd.DataFrame,
+        returns: pd.Series,
+        universe: pd.Series,
+        progress: StageProgress,
+    ) -> PreparedFactorModel:
+        return self._prepare(market_data, returns, universe, progress)
+
+    def _prepare(
+        self,
+        market_data: pd.DataFrame,
+        returns: pd.Series,
+        universe: pd.Series,
+        progress: StageProgress | None = None,
+    ) -> PreparedFactorModel:
+        base_prepare = getattr(self.base, "prepare_with_progress", None)
+        if progress is not None and base_prepare is not None:
+            base = base_prepare(market_data, returns, universe, progress)
+        else:
+            base = self.base.prepare(market_data, returns, universe)
         if self.name in base.names:
             raise ValueError(f"duplicate factor name: {self.name}")
         tickers, initial_betas = self._initial_state(market_data, returns, universe)
+        base_steps = getattr(self.base, "progress_steps", None)
+        if progress is not None and isinstance(base_steps, int):
+            progress.update(base_steps + 1, f"bootstrap {self.name}")
         market_returns = self._market_returns(market_data, returns, universe)
+        if progress is not None and isinstance(base_steps, int):
+            progress.update(base_steps + 2, f"prepare {self.name} returns")
         return _PreparedRecursiveMarketBeta(
             base=base,
             name=self.name,
@@ -137,6 +170,9 @@ class RecursiveMarketBetaModel:
         tickers = returns.index.get_level_values("ticker").unique()
         positions = {str(ticker): position for position, ticker in enumerate(tickers)}
         initial_betas = np.full(len(tickers), self.initial_beta, dtype="float64")
+        if history.empty:
+            return tickers, initial_betas
+
         for ticker, observations in history.groupby(level="ticker", sort=False):
             observations = observations.tail(self.lookback_days)
             if len(observations) < self.min_periods:

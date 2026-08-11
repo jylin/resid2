@@ -13,6 +13,8 @@ import pyarrow.dataset as ds
 from pydantic import Field
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
+from resid.progress import StageProgress
+
 MARCAP_COLUMNS = ["Date", "Code", "ChangesRatio", "Marcap"]
 _ARROW_COMPUTE = cast(Any, pc)
 
@@ -130,9 +132,23 @@ class FixedTopMarketCapUniverse:
     size: int = Field(gt=0)
 
     def build(self, source: MarketDataSource, window: AnalysisWindow) -> pd.Series:
+        return self.build_with_progress(source, window)
+
+    @property
+    def progress_steps(self) -> int:
+        return 3
+
+    def build_with_progress(
+        self,
+        source: MarketDataSource,
+        window: AnalysisWindow,
+        progress: StageProgress | None = None,
+    ) -> pd.Series:
         dates = source.trading_dates(window.start, window.end)
         if not len(dates):
             raise ValueError("analysis window contains no trading dates")
+        if progress is not None:
+            progress.update(1, "trading dates")
         try:
             snapshot_date = source.latest_date(
                 (dates[0] - pd.Timedelta(days=1)).date().isoformat()
@@ -143,6 +159,8 @@ class FixedTopMarketCapUniverse:
                 "analysis date"
             ) from exc
         snapshot = source.load(snapshot_date, snapshot_date).reset_index()
+        if progress is not None:
+            progress.update(2, "pre-window snapshot")
         tickers = (
             snapshot.loc[snapshot["market_cap"].gt(0)]
             .sort_values(
@@ -155,6 +173,8 @@ class FixedTopMarketCapUniverse:
         )
         if not len(tickers):
             raise ValueError("fixed universe snapshot contains no positive market caps")
+        if progress is not None:
+            progress.update(3, "select members")
         index = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
         return pd.Series(True, index=index, name="in_universe")
 
@@ -166,9 +186,23 @@ class DailyTopMarketCapUniverse:
     size: int = Field(gt=0)
 
     def build(self, source: MarketDataSource, window: AnalysisWindow) -> pd.Series:
+        return self.build_with_progress(source, window)
+
+    @property
+    def progress_steps(self) -> int:
+        return 3
+
+    def build_with_progress(
+        self,
+        source: MarketDataSource,
+        window: AnalysisWindow,
+        progress: StageProgress | None = None,
+    ) -> pd.Series:
         dates = source.trading_dates(window.start, window.end)
         if not len(dates):
             raise ValueError("analysis window contains no trading dates")
+        if progress is not None:
+            progress.update(1, "trading dates")
         previous_date = source.latest_date(
             (dates[0] - pd.Timedelta(days=1)).date().isoformat()
         )
@@ -179,6 +213,8 @@ class DailyTopMarketCapUniverse:
             .rename("market_cap")
             .reset_index()
         )
+        if progress is not None:
+            progress.update(2, "daily snapshots")
         effective_dates = dict(zip(snapshot_dates, dates, strict=True))
         snapshots["date"] = snapshots["date"].map(effective_dates)
         members = (
@@ -191,6 +227,8 @@ class DailyTopMarketCapUniverse:
             .head(self.size)
         )
         index = pd.MultiIndex.from_frame(members[["date", "ticker"]])
+        if progress is not None:
+            progress.update(3, "select daily members")
         return pd.Series(True, index=index, name="in_universe").sort_index()
 
 
